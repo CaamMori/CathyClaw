@@ -92,23 +92,30 @@ wait_gateway_ready() {
 HELP=false
 NEED_RESTART=false
 WITH_MIHOMO=false
+MIHOMO_DECIDED=false      # 用户是否显式表态（显式则跳过自动探测）
 WITH_TASK_ENGINE=false
 WITH_SANDBOX=false
+MIHOMO_AUTO_DETECT="${MIHOMO_AUTO_DETECT:-1}"
 for arg in "$@"; do
   case "$arg" in
-    --with-mihomo) WITH_MIHOMO=true ;;
+    --with-mihomo) WITH_MIHOMO=true; MIHOMO_DECIDED=true ;;
+    --without-mihomo|--no-mihomo) WITH_MIHOMO=false; MIHOMO_DECIDED=true ;;
     --with-task-engine) WITH_TASK_ENGINE=true ;;
     --with-sandbox) WITH_SANDBOX=true ;;
     --help|-h)   HELP=true ;;
-    *) fail "未知参数: $arg。支持的参数: --with-mihomo --with-task-engine --with-sandbox --help" ;;
+    *) fail "未知参数: $arg。支持的参数: --with-mihomo --without-mihomo --with-task-engine --with-sandbox --help" ;;
   esac
 done
 if $HELP; then
   echo "用法: sudo ./scripts/install.sh [选项]"
-  echo "  --with-mihomo       启用 mihomo TUN 代理 sidecar"
+  echo "  --with-mihomo       强制启用 mihomo TUN 代理 sidecar（境内机出海）"
+  echo "  --without-mihomo    强制禁用 mihomo（海外机直连，默认按实测自动判定）"
   echo "  --with-task-engine  启用任务引擎（taskctl + taskboard + stale guard）"
   echo "  --with-sandbox      启用 docker.sock 挂载（用于 OpenClaw 沙箱）"
   echo "  --help              显示此帮助"
+  echo ""
+  echo "说明：不传 mihomo 开关时，安装脚本会实测能否直连 GitHub——"
+  echo "      能直连（海外机）则跳过 mihomo；不能（境内机）则自动启用。"
   exit 0
 fi
 
@@ -140,9 +147,32 @@ DOMAIN="${DOMAIN:-}"
 GATEWAY_IMAGE="${GATEWAY_IMAGE:-ghcr.io/openclaw/openclaw:2026.7.1}"
 MIHOMO_IMAGE="${MIHOMO_IMAGE:-metacubex/mihomo:latest}"
 DOCKER_GROUP_ID="${DOCKER_GROUP_ID:-999}"
-[ "${MIHOMO_ENABLE:-}" = "1" ] && WITH_MIHOMO=true
+# .env 里显式写 MIHOMO_ENABLE 也算用户表态（0=强制关，1=强制开），跳过自动探测
+case "${MIHOMO_ENABLE:-}" in
+  1) WITH_MIHOMO=true;  MIHOMO_DECIDED=true ;;
+  0) WITH_MIHOMO=false; MIHOMO_DECIDED=true ;;
+esac
 [ "${TASK_ENGINE_ENABLE:-}" = "1" ] && WITH_TASK_ENGINE=true
 [ "${SANDBOX_ENABLE:-}" = "1" ] && WITH_SANDBOX=true
+
+# ── 出口自动判定：境内机才需要 mihomo，海外机直连即可 ──
+# mihomo TUN sidecar 的唯一职责是「在无法直连 GitHub / 模型 API 的机器上提供出海出口」。
+# 海外 VPS（AWS/GCP/DO 等）本来就能直连，套一层 TUN 只会：多一个容器、多一个故障点
+# （netns 失效、节点挂掉）、还平白增加资源开销。所以这里以实测为准自动决策，
+# 不让使用者为「自己是境内还是海外」这种机器自己就知道的事做选择。
+#
+# 判定方式：HEAD 请求探 GitHub（HTTP 层可达即算直连可用），超时 6s。
+# 显式传了 --with-mihomo / --without-mihomo 或 .env 里 MIHOMO_ENABLE 时，尊重用户选择。
+if [ "${MIHOMO_AUTO_DETECT}" = "1" ] && ! $MIHOMO_DECIDED; then
+  if ! curl -fsS -o /dev/null --max-time 6 https://github.com 2>/dev/null; then
+    info "直连 GitHub 失败 → 判定为境内机，自动启用 mihomo 出海代理"
+    WITH_MIHOMO=true
+    MIHOMO_AUTO_ENABLED=true
+  else
+    info "直连 GitHub 正常 → 判定为海外机，跳过 mihomo（直连即出口）"
+    MIHOMO_AUTO_ENABLED=false
+  fi
+fi
 # 交互安装时让用户直接提供域名；该值同时用于 Nginx、Let's Encrypt 与 Control UI 来源白名单。
 # 非交互环境继续只从 .env / DOMAIN 环境变量读取，避免 CI 卡在输入提示。
 if $INTERACTIVE && [ -z "$DOMAIN" ]; then
