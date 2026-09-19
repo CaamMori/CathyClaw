@@ -406,6 +406,23 @@ ok "密钥已写入 /data/etc/openclaw/runtime.env"
 step "6. 部署 Gateway"
 docker pull "${GATEWAY_IMAGE}" 2>&1 | tail -3
 
+# 补丁必须在启动容器【之前】就位：compose 的 entrypoint 指向
+# /data/opt/openclaw-patches/entrypoint.sh，容器启动时即执行。
+# 若放到 §10.7 再装，容器会以
+#   exec: "/data/opt/openclaw-patches/entrypoint.sh": no such file or directory
+# 启动失败——这是顺序依赖，不是可选步骤。
+mkdir -p /data/opt/openclaw-patches
+if compgen -G "$PROJECT_DIR/openclaw-patches/*.sh" > /dev/null; then
+  cp "$PROJECT_DIR"/openclaw-patches/*.sh /data/opt/openclaw-patches/
+  chmod +x /data/opt/openclaw-patches/*.sh
+  ok "启动补丁已就位（/data/opt/openclaw-patches）"
+else
+  # 兜底：补丁文件缺失时移除 entrypoint 覆盖，用镜像默认入口启动，
+  # 至少让 Gateway 可用（代价是失去工具预算补丁与孤儿锁清理，会在收尾告警）。
+  warn "缺少 openclaw-patches/*.sh，移除 compose entrypoint 覆盖（将失去启动期补丁）"
+  ENTRYPOINT_STRIPPED=true
+fi
+
 # 生成 docker-compose.yml（持久化，避免 /tmp 被清）
 # 用 sed 替换模板中的 YOUR_* 占位符（比 envsubst 更直观，占位符即文档）。
 COMPOSE_FILE="/data/etc/openclaw/docker-compose.yml"
@@ -447,6 +464,18 @@ if grep -vE '^\s*#' "${COMPOSE_FILE}" | grep -qE 'YOUR_[A-Z_]+'; then
   fail "docker-compose 生成失败：存在未替换的占位符。残留: $(grep -vE '^\s*#' "${COMPOSE_FILE}" | grep -oE 'YOUR_[A-Z_]+' | sort -u | tr '\n' ' ')"
 fi
 chmod 600 "${COMPOSE_FILE}"
+
+# 若补丁缺失，剥离 gateway 的 entrypoint 覆盖（见 §6 兜底逻辑）
+if [ "${ENTRYPOINT_STRIPPED:-false}" = "true" ]; then
+  python3 - "${COMPOSE_FILE}" << 'PYEOF_EP'
+import sys, re
+path = sys.argv[1]
+text = open(path, encoding="utf-8").read()
+text = re.sub(r'\n    entrypoint: \["/data/opt/openclaw-patches/entrypoint\.sh"\]', '', text, count=1)
+open(path, "w", encoding="utf-8").write(text)
+print("entrypoint override stripped (patches missing)")
+PYEOF_EP
+fi
 
 # 若未启用沙箱，移除 docker.sock 挂载以降低攻击面
 if ! $WITH_SANDBOX; then
@@ -702,11 +731,11 @@ fi
     cp "$s" "/usr/local/bin/$b" && chmod +x "/usr/local/bin/$b" && ok "$b installed"
   done
 
-  # 2) 启动补丁 + 孤儿锁清理（挂载进 gateway 容器由 entrypoint 调用）
+  # 2) 启动补丁（已在 §6 启动容器前安装；此处幂等刷新，保证重跑/升级后是最新版）
   mkdir -p /data/opt/openclaw-patches
   cp "$PROJECT_DIR"/openclaw-patches/*.sh /data/opt/openclaw-patches/ 2>/dev/null
   chmod +x /data/opt/openclaw-patches/*.sh
-  ok "openclaw-patches 安装到 /data/opt/openclaw-patches"
+  ok "openclaw-patches 已刷新（/data/opt/openclaw-patches）"
 
   # 2.1) cdp-relay.js 需要被 gateway 容器内调用；同时保留宿主机副本供 systemd 拉起
   if [ -f "$PROJECT_DIR/scripts/ops/cdp-relay.js" ]; then
