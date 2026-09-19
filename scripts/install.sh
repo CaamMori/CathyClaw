@@ -528,12 +528,18 @@ install_docker_cli() {
   # 关键：必须是【文件】——类型错了容器就再也起不来。
   rm -rf /data/opt/docker-cli/docker /data/opt/docker-cli/docker.real
   cp "$host_docker" /data/opt/docker-cli/docker.real
-  # 包装脚本内部路径必须与真实安装路径一致（此前写死 /usr/local/bin/docker.real，
-  # 与实际的 /data/opt/docker-cli/docker.real 不符，沙箱内会找不到可执行文件）。
+  # wrapper 必须用【相对自身位置】解析真实二进制，不能写死绝对路径：
+  # 同一个文件被 compose 挂到两个视角下的不同路径——
+  #   宿主      : /data/opt/docker-cli/docker.real
+  #   容器/沙箱 : /usr/local/bin/docker.real
+  # 写死任一个都会在另一个视角下找不到可执行文件：
+  #   /usr/local/bin/docker: 3: exec: /data/opt/docker-cli/docker.real: not found
+  # 用 dirname "$0" 让两条路径自动成立。
   cat > /data/opt/docker-cli/docker <<'DOCKEREOF'
 #!/bin/sh
-# 沙箱内 docker CLI 包装：默认走宿主 docker.sock
-exec /data/opt/docker-cli/docker.real "$@"
+# 沙箱内 docker CLI 包装：默认走宿主 docker.sock。
+# 按自身所在目录解析 docker.real，兼容宿主与容器两个挂载视角。
+exec "$(dirname "$0")/docker.real" "$@"
 DOCKEREOF
   chmod +x /data/opt/docker-cli/docker /data/opt/docker-cli/docker.real
   ok "docker-cli 包装已就位（源: ${host_docker}）"
