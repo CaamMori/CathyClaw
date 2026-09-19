@@ -52,6 +52,49 @@ prompt() {
 }
 
 
+# ── 供应链校验 ──
+# 原则：凡是"从网络取回、随后被当作代码执行或以 root 运行"的东西，都要验身份。
+# 本项目有三类外部输入：① Docker apt 源签名密钥 ② 沙箱镜像构建文件 ③ 官方安装脚本。
+# 能用指纹/校验和的就用，不能的（如 raw.githubusercontent 上的构建文件，官方未提供
+# 发布校验和）就做到：固定 git ref（不用可变分支）+ 内容落盘后打印指纹供审计 + 失败即告警。
+# 不假装这些检查比它们实际能做到的更严格。
+
+# Docker 官方 apt 仓库签名密钥指纹（长期稳定，跨 ubuntu/debian 一致）。
+# 校验它的意义：apt 之后会用它验证每一个 deb 包的签名，
+# 所以这一条是整个 Docker 供应链的信任根——被替换则后面全是空谈。
+DOCKER_GPG_FPR="9DC8 5822 9FC7 DD38 854A E2D8 8D81 803C 0EBF CD88"
+
+# 验证一个 ASCII-armored PGP 公钥文件的主密钥指纹是否与期望一致。
+# 需要 gpg（由调用方保证已安装）。返回 0 表示一致。
+verify_gpg_fingerprint() {
+  local keyfile="$1" expected="$2"
+  local gnupg_home actual
+  gnupg_home="$(mktemp -d)"
+  # --show-keys 只解析不导入，避免污染宿主 keyring
+  actual="$(gpg --homedir "$gnupg_home" --show-keys --with-colons --with-fingerprint "$keyfile" 2>/dev/null \
+            | awk -F: '/^fpr:/ {print $10; exit}')"
+  rm -rf "$gnupg_home"
+  [ -n "$actual" ] || return 1
+  # 归一化：去掉空格并大写后比较
+  local a_norm e_norm
+  a_norm="$(printf '%s' "$actual" | tr -d ' ' | tr '[:lower:]' '[:upper:]')"
+  e_norm="$(printf '%s' "$expected" | tr -d ' ' | tr '[:lower:]' '[:upper:]')"
+  [ "$a_norm" = "$e_norm" ]
+}
+
+# 打印文件的 SHA256 与实际大小，供部署后审计与异地比对。
+# 用途：沙箱构建文件来自 raw.githubusercontent（官方未发布校验和），
+# 无法"预先固定期望值"，但可以做到"每次都记录下来"，事后可比对是否被改动。
+record_file_digest() {
+  local f="$1"
+  [ -f "$f" ] || return 0
+  local digest size
+  digest="$(sha256sum "$f" 2>/dev/null | awk '{print $1}')"
+  size="$(wc -c < "$f" 2>/dev/null | tr -d ' ')"
+  printf '%s  %s  (%s bytes)\n' "${digest:-N/A}" "$(basename "$f")" "${size:-0}"
+}
+
+
 # 等待 Gateway 容器 healthy（与 compose healthcheck 对齐，覆盖 start_period 120s）。
 # 不只看容器 Up（Up 可能仍 starting），而看 docker inspect Health.Status；异常则 fail。
 verify_control_ui() {
@@ -328,7 +371,24 @@ if ! command -v docker >/dev/null 2>&1; then
   esac
   apt-get install -y ca-certificates curl gnupg
   install -m 0755 -d /etc/apt/keyrings
-  curl -fsSL "https://download.docker.com/linux/${DOCKER_DISTRO}/gpg" -o /etc/apt/keyrings/docker.asc
+  # 先落到临时文件，校验指纹通过才启用——避免"先信任后检查"。
+  DOCKER_GPG_TMP="$(mktemp)"
+  if curl -fsSL "https://download.docker.com/linux/${DOCKER_DISTRO}/gpg" -o "$DOCKER_GPG_TMP"; then
+    if verify_gpg_fingerprint "$DOCKER_GPG_TMP" "$DOCKER_GPG_FPR"; then
+      install -m 0644 "$DOCKER_GPG_TMP" /etc/apt/keyrings/docker.asc
+      ok "Docker 仓库签名密钥指纹校验通过"
+    else
+      rm -f "$DOCKER_GPG_TMP"
+      fail "Docker 仓库签名密钥指纹不匹配！
+  期望: ${DOCKER_GPG_FPR}
+  可能是网络劫持/MITM，或官方轮换了密钥。
+  已中止安装。若确认官方轮换，请更新 install.sh 中的 DOCKER_GPG_FPR 后重跑。"
+    fi
+  else
+    rm -f "$DOCKER_GPG_TMP"
+    fail "无法下载 Docker 仓库签名密钥（网络问题？）。拒绝在无签名校验的情况下继续安装 Docker。"
+  fi
+  rm -f "$DOCKER_GPG_TMP"
   chmod a+r /etc/apt/keyrings/docker.asc
   echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/${DOCKER_DISTRO} $(. /etc/os-release && echo "$VERSION_CODENAME") stable" > /etc/apt/sources.list.d/docker.list
   apt-get update -qq && apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
@@ -1132,14 +1192,25 @@ if $WITH_SANDBOX; then
   else
     mkdir -p "$SANDBOX_BUILD_DIR"
     # 官方构建脚本随 openclaw 源码分发；优先从 GitHub 拉取 scripts/ 下的构建文件。
+    # 供应链：官方未对这些文件发布校验和，因此这里做两件能做的事：
+    #   ① 固定 ref（默认 main 可被覆盖，但鼓励用 tag/commit 锁定，避免上游静默改动）；
+    #   ② 落盘后把所有文件的 SHA256 写入清单，供审计与异地比对。
+    # 不假装这等于"已验证"——它只保证"可复现、可追溯"。
     OW_SRC_REF="${OPENCLAW_SRC_REF:-main}"
+    if [ "$OW_SRC_REF" = "main" ]; then
+      warn "沙箱构建文件使用 main 分支（可被上游静默改动）；如需可复现构建请设 OPENCLAW_SRC_REF=<tag|commit>"
+    fi
     OW_BASE="https://raw.githubusercontent.com/openclaw/openclaw/${OW_SRC_REF}"
     _fetch() {
       local rel="$1" dst="$SANDBOX_BUILD_DIR/$1"
       mkdir -p "$(dirname "$dst")"
-      if curl -fsSL --max-time 30 "${OW_BASE}/${rel}" -o "$dst" 2>/dev/null; then
+      # 下到临时文件再 mv：避免半截文件被当成"已存在"而在重跑时被跳过
+      local tmp="${dst}.part"
+      if curl -fsSL --max-time 30 "${OW_BASE}/${rel}" -o "$tmp" 2>/dev/null && [ -s "$tmp" ]; then
+        mv "$tmp" "$dst"
         return 0
       fi
+      rm -f "$tmp"
       return 1
     }
     ok_fetch=true
@@ -1149,6 +1220,20 @@ if $WITH_SANDBOX; then
     done
     if ! $ok_fetch; then
       warn "官方沙箱构建文件拉取不全（可能需要代理）。可稍后手动补齐 $SANDBOX_BUILD_DIR 后重跑。"
+    else
+      # 记录指纹清单（含 ref），便于事后核对构建输入是否被改动。
+      DIGEST_MANIFEST="$SANDBOX_BUILD_DIR/SHA256SUMS.manifest"
+      {
+        echo "# 来源: ${OW_BASE}/"
+        echo "# ref : ${OW_SRC_REF}"
+        echo "# 生成: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        for f in Dockerfile.sandbox Dockerfile.sandbox-browser Dockerfile.sandbox-common \
+                 scripts/sandbox-setup.sh scripts/sandbox-browser-setup.sh scripts/sandbox-common-setup.sh; do
+          [ -f "$SANDBOX_BUILD_DIR/$f" ] && record_file_digest "$SANDBOX_BUILD_DIR/$f"
+        done
+      } > "$DIGEST_MANIFEST"
+      ok "沙箱构建文件指纹清单: $DIGEST_MANIFEST"
+      info "沙箱构建输入来自 ${OW_SRC_REF}；已记录 SHA256 便于审计（非官方签名校验）"
     fi
   fi
 
