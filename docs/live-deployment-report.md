@@ -275,5 +275,5 @@ a442dc3  fix: openclaw.json schema 嵌套错误 + fallback/telegram 兜底
   `--with-sandbox` 的**镜像构建未验证**；`docker.sock` 挂载与组权限链路已验证通过。
 - 测试机密钥来自 `cap.zip`，测完建议轮换或回收。
 - 此前泄漏过一个 GitHub PAT（已从代码中清除），建议尽快吊销该 token。
-- 仓库提交尚未推送到远端 `CaamMori/OpenClaw-CakeClaw`。
+- 仓库提交已推送至远端 `CaamMori/CathyClaw`。
 

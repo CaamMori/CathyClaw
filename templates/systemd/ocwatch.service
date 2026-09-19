@@ -1,6 +1,6 @@
 [Unit]
 Description=OpenClaw health watchdog (ocwatch)
-Documentation=https://github.com/CaamMori/OpenClaw-CakeClaw
+Documentation=https://github.com/CaamMori/CathyClaw
 After=docker.service
 Requires=docker.service
 

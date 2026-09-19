@@ -10,8 +10,8 @@
 ## 最小安装
 
 ```bash
-git clone https://github.com/CaamMori/OpenClaw-CakeClaw.git
-cd OpenClaw-CakeClaw
+git clone https://github.com/CaamMori/CathyClaw.git
+cd CathyClaw
 sudo ./scripts/install.sh
 ```
 
