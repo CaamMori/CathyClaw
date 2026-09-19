@@ -152,7 +152,7 @@ fi
 
 # 默认值
 DOMAIN="${DOMAIN:-}"
-GATEWAY_IMAGE="${GATEWAY_IMAGE:-ghcr.io/openclaw/openclaw:2026.7.1}"
+GATEWAY_IMAGE="${GATEWAY_IMAGE:-ghcr.io/openclaw/openclaw:2026.9.4}"
 MIHOMO_IMAGE="${MIHOMO_IMAGE:-metacubex/mihomo:latest}"
 DOCKER_GROUP_ID="${DOCKER_GROUP_ID:-999}"
 # .env 里显式写 MIHOMO_ENABLE 也算用户表态（0=强制关，1=强制开），跳过自动探测
@@ -195,7 +195,7 @@ if $INTERACTIVE && [ -z "$DOMAIN" ]; then
   fi
 fi
 GATEWAY_PORT="${GATEWAY_PORT:-18789}"
-GATEWAY_IMAGE="${GATEWAY_IMAGE:-ghcr.io/openclaw/openclaw:2026.7.1}"
+GATEWAY_IMAGE="${GATEWAY_IMAGE:-ghcr.io/openclaw/openclaw:2026.9.4}"
 SSH_PORT="${SSH_PORT:-22}"
 BACKUP_RETENTION_DAYS="${BACKUP_RETENTION_DAYS:-7}"
 CONN_LIMIT="${CONN_LIMIT:-15}"
