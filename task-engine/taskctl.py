@@ -192,24 +192,38 @@ def execute(argv, timeout, log_path, hb_path=None):
 
 def worker(tid, timeout, argv):
     path, _ = load(tid); lock_path = path.parent / "run.lock"
-    with open_lock(lock_path) as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        path, data = load(tid)
-        # Parent has already recorded running state. Worker now owns the durable lease.
-        hb_path = path.parent / "heartbeat.json"
-        data.update(status="running", pid=os.getpid(), worker_started_at=now())
-        save(path, data)
-        try:
-            code, timed_out = execute(argv, timeout, path.parent / "run.log", hb_path)
+    # 【为什么终态写入必须在锁外】
+    # 原实现把"写 awaiting_verification"和最后的 heartbeat 都放在 with 内，
+    # 于是出现一个窗口：状态字段已经对外可见，但 run.lock 还没释放。
+    # 此时若有人立刻 verify（正常操作——看到 awaiting_verification 就验收），
+    # verify 的 flock(LOCK_EX|LOCK_NB) 会失败并报 "task busy"，返回码 1。
+    # 这在负载高的机器上偶发：CI runner 上复现过一次，本地连跑 8 次不复现。
+    # 症状是"测试不稳定"，根因却是产品缺陷——真实运维同样会踩到。
+    #
+    # 锁的语义是"独占执行权"，不是"保护 task.json"（save 走 atomic_write，
+    # 本身是原子的，无需持锁）。因此把终态写入与心跳移出 with 是安全且更正确的：
+    # 执行期间仍持锁（保证不被并发 run/verify 抢占），执行结束即释放，
+    # 之后才对外公布终态——对外可见的状态与可操作状态保持一致。
+    hb_path = path.parent / "heartbeat.json"
+    try:
+        with open_lock(lock_path) as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
             path, data = load(tid)
-            data.update(status=("timeout" if timed_out else ("awaiting_verification" if code == 0 else "failed")),
-                        exit_code=code, pid=None, finished_at=now())
+            # Parent has already recorded running state. Worker now owns the durable lease.
+            data.update(status="running", pid=os.getpid(), worker_started_at=now())
             save(path, data)
-            heartbeat(hb_path, data["status"])
-        except BaseException as e:
-            path, data = load(tid); data.update(status="failed", pid=None,
-                worker_error=type(e).__name__, finished_at=now()); save(path, data)
-            raise
+            code, timed_out = execute(argv, timeout, path.parent / "run.log", hb_path)
+        final = ("timeout" if timed_out else ("awaiting_verification" if code == 0 else "failed"))
+    except BaseException as e:
+        path, data = load(tid)
+        data.update(status="failed", pid=None, worker_error=type(e).__name__, finished_at=now())
+        save(path, data)
+        raise
+    # 锁已释放，此时公布终态不会与 verify 争抢。
+    path, data = load(tid)
+    data.update(status=final, exit_code=code, pid=None, finished_at=now())
+    save(path, data)
+    heartbeat(hb_path, final)
 
 def normalize_timeout_argv(args, accept_flags=()):
     # argparse REMAINDER preserves command flags; accept documented timeout/--force after ID.
