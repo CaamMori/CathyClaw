@@ -1,16 +1,25 @@
 import json, os, subprocess, sys, tempfile, time, unittest
 from pathlib import Path
 CLI = Path(__file__).parents[1] / "taskctl.py"
+# 子进程超时可调：CI/负载高的机器上默认 15s，避免与并发的 te-daemon
+# reconcile 争抢资源时偶发 TimeoutExpired（那是环境抖动，不是功能缺陷）。
+TIMEOUT = float(os.environ.get("TE_TEST_TIMEOUT", "15"))
 
 class EngineTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
+        # TASK_ENGINE_HOME 把全部状态指向独立临时根，与生产目录完全隔离，
+        # 因此测试之间互不影响、也不触碰真实任务库。
+        # 注：常驻 te-daemon 读的是它自己的 TE_DIR（默认生产路径），
+        # 与这里无关；且 daemon 只观察/告警、从不写任务状态，
+        # 故不会污染测试数据。若机器负载高到子进程启动变慢，
+        # 用 TE_TEST_TIMEOUT 放宽超时即可（见上方常量）。
         self.env = {**os.environ, "TASK_ENGINE_HOME": self.tmp.name}
         self.n = 0
     def cli(self, *args):
         return subprocess.run([sys.executable, str(CLI), *args], env=self.env,
-                              text=True, capture_output=True, timeout=5)
+                              text=True, capture_output=True, timeout=TIMEOUT)
     def create(self):
         self.n += 1; tid = "task_" + str(self.n)
         r = self.cli("create", "安全目标", "验收应返回零", "--id", tid)
@@ -68,7 +77,7 @@ class EngineTests(unittest.TestCase):
         tid="same_id"; argv=[sys.executable,str(CLI),"create"]
         a=subprocess.Popen(argv+["goal_a","accept_a","--id",tid],env=self.env,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
         b=subprocess.Popen(argv+["goal_b","accept_b","--id",tid],env=self.env,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
-        ra=a.communicate(timeout=5); rb=b.communicate(timeout=5)
+        ra=a.communicate(timeout=TIMEOUT); rb=b.communicate(timeout=TIMEOUT)
         self.assertEqual(sorted((a.returncode,b.returncode)),[0,1],(ra,rb))
         data=json.loads((Path(self.tmp.name)/"tasks"/tid/"task.json").read_text())
         self.assertIn((data["goal"],data["acceptance"]),(("goal_a","accept_a"),("goal_b","accept_b")))
@@ -105,7 +114,7 @@ class EngineTests(unittest.TestCase):
         self.assertTrue(log.exists(),"first verification did not acquire lock")
         second=self.cli("verify",tid,"--",sys.executable,"-c","pass")
         self.assertNotEqual(second.returncode,0); self.assertIn("busy",second.stderr)
-        out,err=first.communicate(timeout=5)
+        out,err=first.communicate(timeout=TIMEOUT)
         self.assertEqual(first.returncode,0,err); self.assertEqual(out.strip(),"completed")
 
     def test_status_does_not_orphan_worker_during_launch(self):

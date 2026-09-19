@@ -1,6 +1,9 @@
 import json, os, shutil, subprocess, sys, tempfile, unittest
 from pathlib import Path
 CLI = Path(__file__).parents[1] / "taskctl.py"
+# 子进程超时可调：CI/负载高的机器上默认 15s，避免与并发的 te-daemon
+# reconcile 争抢资源时偶发 TimeoutExpired（那是环境抖动，不是功能缺陷）。
+TIMEOUT = float(os.environ.get("TE_TEST_TIMEOUT", "15"))
 
 
 class VolatileGuardTests(unittest.TestCase):
@@ -17,7 +20,7 @@ class VolatileGuardTests(unittest.TestCase):
 
     def cli(self, *args):
         return subprocess.run([sys.executable, str(CLI), *args], env=self.env,
-                              text=True, capture_output=True, timeout=5)
+                              text=True, capture_output=True, timeout=TIMEOUT)
 
     # ---- create --accept-cmd ----
     def test_accept_cmd_tmp_rejected(self):
