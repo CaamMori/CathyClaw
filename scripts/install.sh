@@ -95,6 +95,136 @@ record_file_digest() {
 }
 
 
+# ── 环境变量体检 ──
+# 读 /data/etc/openclaw/runtime.env 与 /data/state/openclaw.json，
+# 逐个核对 openclaw.json 里所有 ${VAR} 引用是否真有值（非空、非占位符）。
+#
+# 分级依据来自实测：测试机上 Gateway healthy、cron 齐备、安装日志全绿，
+# 但发消息时报 "Outbound not configured for channel: telegram"——
+# 因为 TELEGRAM_BOT_TOKEN 在 openclaw.json 里是 ${TELEGRAM_BOT_TOKEN}，
+# 而 runtime.env 里该键为空。健康检查不覆盖业务通道，所以这类缺失不会被发现。
+#
+# 退出码：0 = 全部就绪；2 = 有严重/重要缺失（功能不可用）；其他 = 体检本身失败。
+env_health_check() {
+  local rc=0
+  python3 - <<'PYEOF_ENVHEALTH' || rc=$?
+import json, re, sys
+
+RUNTIME_ENV = "/data/etc/openclaw/runtime.env"
+OPENCLAW_JSON = "/data/state/openclaw.json"
+
+# 1) 读取 runtime.env 中已设的变量（非注释、含 = 的行）
+env_set = {}
+try:
+    with open(RUNTIME_ENV) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            env_set[k.strip()] = v.strip().strip('"').strip("'")
+except FileNotFoundError:
+    print(f"  [WARN] 找不到 {RUNTIME_ENV}，跳过体检")
+    sys.exit(0)
+
+def is_unset(v):
+    """空值或占位符都算未就绪。"""
+    if not v:
+        return True
+    return bool(re.search(r"YOUR_[A-Z0-9_]*_?HERE|CHANGEME|REPLACE_ME|PLACEHOLDER|XXX+", v, re.I))
+
+# 2) 收集 openclaw.json 里所有 ${VAR} 引用及其出现位置
+refs = {}
+try:
+    with open(OPENCLAW_JSON) as f:
+        data = json.load(f)
+except FileNotFoundError:
+    print(f"  [WARN] 找不到 {OPENCLAW_JSON}，跳过体检")
+    sys.exit(0)
+except json.JSONDecodeError as e:
+    print(f"  [!!] {OPENCLAW_JSON} 不是合法 JSON: {e}")
+    sys.exit(1)
+
+def walk(o, path=""):
+    if isinstance(o, dict):
+        for k, v in o.items():
+            walk(v, f"{path}.{k}" if path else k)
+    elif isinstance(o, list):
+        for i, v in enumerate(o):
+            walk(v, f"{path}[{i}]")
+    elif isinstance(o, str):
+        for m in re.finditer(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", o):
+            refs.setdefault(m.group(1), set()).add(path or "(根)")
+
+walk(data)
+
+# 3) 影响分级。写死这四个是因为它们直接决定"核心功能是否哑掉"，
+#    其余变量缺失只影响可选能力，不值得让运维紧张。
+CRITICAL = {
+    "TELEGRAM_BOT_TOKEN": "Telegram 出站消息完全发不出去（Outbound not configured for channel）",
+    "TELEGRAM_OWNER_ID":  "Telegram 侧无法识别 owner：allowFrom 与 elevated 工具均失效",
+}
+IMPORTANT = {
+    "TAVILY_API_KEY": "agent 的联网搜索工具不可用",
+    "GH_TOKEN":       "sandbox 内访问 GitHub 不可用（git clone/push、gh 命令）",
+}
+
+crit, imp, opt = [], [], []
+for var in sorted(refs):
+    if not is_unset(env_set.get(var, "")):
+        continue
+    item = (var, sorted(refs[var])[:2])
+    if var in CRITICAL:
+        crit.append(item)
+    elif var in IMPORTANT:
+        imp.append(item)
+    else:
+        opt.append(item)
+
+ready = len(refs) - len(crit) - len(imp) - len(opt)
+print(f"  openclaw.json 引用了 {len(refs)} 个环境变量，其中 {ready} 个已就绪。")
+print()
+
+if crit:
+    print("  【严重】缺这些会让核心功能不可用：")
+    for var, uses in crit:
+        print(f"    - {var}")
+        print(f"        影响: {CRITICAL[var]}")
+        print(f"        引用位置: {', '.join(uses)}")
+    print()
+
+if imp:
+    print("  【重要】缺这些会削弱 agent 能力：")
+    for var, uses in imp:
+        print(f"    - {var}  → {IMPORTANT[var]}")
+    print()
+
+if opt:
+    print(f"  【可选】未设置（不影响启动）：{', '.join(v for v, _ in opt)}")
+    print()
+
+if crit or imp:
+    print("  修复：编辑 /data/etc/openclaw/runtime.env 填入真实值，然后")
+    print("        docker compose -f /data/etc/openclaw/docker-compose.yml up -d")
+    print("        可单独复检：sudo ./scripts/install.sh --env-check")
+    sys.exit(2)
+
+print("  [OK] 所有被引用的环境变量均已就绪")
+sys.exit(0)
+PYEOF_ENVHEALTH
+
+  case "$rc" in
+    0) info "环境变量体检通过" ;;
+    2)
+      warn "存在未配置的关键环境变量——Gateway 能起来，但部分功能不可用"
+      warn "这是配置缺失，不是安装故障；清单见上方。"
+      ;;
+    *) warn "环境变量体检未能完成（见上方输出）" ;;
+  esac
+  return "$rc"
+}
+
+
 # 等待 Gateway 容器 healthy（与 compose healthcheck 对齐，覆盖 start_period 120s）。
 # 不只看容器 Up（Up 可能仍 starting），而看 docker inspect Health.Status；异常则 fail。
 verify_control_ui() {
@@ -151,6 +281,7 @@ WITH_MIHOMO=false
 MIHOMO_DECIDED=false      # 用户是否显式表态（显式则跳过自动探测）
 WITH_TASK_ENGINE=false
 WITH_SANDBOX=false
+ENV_CHECK_ONLY=false
 MIHOMO_AUTO_DETECT="${MIHOMO_AUTO_DETECT:-1}"
 for arg in "$@"; do
   case "$arg" in
@@ -158,8 +289,9 @@ for arg in "$@"; do
     --without-mihomo|--no-mihomo) WITH_MIHOMO=false; MIHOMO_DECIDED=true ;;
     --with-task-engine) WITH_TASK_ENGINE=true ;;
     --with-sandbox) WITH_SANDBOX=true ;;
+    --env-check) ENV_CHECK_ONLY=true ;;
     --help|-h)   HELP=true ;;
-    *) fail "未知参数: $arg。支持的参数: --with-mihomo --without-mihomo --with-task-engine --with-sandbox --help" ;;
+    *) fail "未知参数: $arg。支持的参数: --with-mihomo --without-mihomo --with-task-engine --with-sandbox --env-check --help" ;;
   esac
 done
 if $HELP; then
@@ -168,11 +300,21 @@ if $HELP; then
   echo "  --without-mihomo    强制禁用 mihomo（海外机直连，默认按实测自动判定）"
   echo "  --with-task-engine  启用任务引擎（taskctl + taskboard + stale guard）"
   echo "  --with-sandbox      启用 docker.sock 挂载（用于 OpenClaw 沙箱）"
+  echo "  --env-check         只做环境变量体检后退出（不安装、不改动任何文件）"
   echo "  --help              显示此帮助"
   echo ""
   echo "说明：不传 mihomo 开关时，安装脚本会实测能否直连 GitHub——"
   echo "      能直连（海外机）则跳过 mihomo；不能（境内机）则自动启用。"
   exit 0
+fi
+
+# ── 0. 仅体检模式 ──
+# 把体检抽成独立入口的价值：装完之后配置是会被改的（轮换 token、临时摘掉某个 key）。
+# 只有完整安装才能体检的话，运维不会为了查一个变量去重跑安装。
+if $ENV_CHECK_ONLY; then
+  step "环境变量体检（--env-check，只读，不做任何改动）"
+  env_health_check
+  exit $?
 fi
 
 # ── 1. 特权检查 ──
@@ -1682,6 +1824,17 @@ fi
 # ── 12.9 控制台验收 ──
 step "12.9 控制台验收"
 verify_control_ui
+
+# ── 12.10 环境变量体检 ──
+# 为什么需要这一步：模板里有十几个 ${VAR} 引用，但安装过程只保证把文件铺好，
+# 不保证这些变量真的有值。缺值时 Gateway 依然 healthy（健康检查不依赖业务通道），
+# 直到真的发一条消息才报 "Outbound not configured for channel: telegram"。
+# 也就是说，安装"成功"了，功能却是哑的，而安装日志里一个字都没提。
+# 因此收尾时统一做一次体检，把"哪些能力因为缺配置而不可用"明确讲出来。
+step "12.10 环境变量体检"
+env_health_check || true
+
+# ── 完成 ──
 
 # ── 完成 ──
 echo ""
