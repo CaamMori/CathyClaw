@@ -379,6 +379,75 @@ else
   ok "openclaw.json 已存在，跳过（保留用户配置）"
 fi
 
+# 占位符落值：模板里所有 ${XXX} 都是「运行时由 OpenClaw 自己从 env 展开」的语法，
+# 唯独 PRIMARY_MODEL / FALLBACK_MODEL 这两个必须在写盘前定死——它们决定了 agents.defaults.model
+# 的结构，若留空会渲染出非法 JSON（fallbacks: [""]）。这里做一遍结构化清洗，
+# 而不是用 sed 盲替，避免把别处的字符串误伤。
+#
+# 清洗规则：
+#   1. ${PRIMARY_MODEL} 未配置 → 移除 model.primary（让用户后续在控制台选）
+#   2. ${FALLBACK_MODEL} 未配置 → 整个移除 model.fallbacks 数组（不要留空串）
+#   3. agents.defaults 顶层若残留 fallbacks（旧模板位置）→ 并入 model.fallbacks 后删除
+PRIMARY_MODEL="${PRIMARY_MODEL:-}" FALLBACK_MODEL="${FALLBACK_MODEL:-}" \
+  python3 - /data/state/openclaw.json << 'PYEOF_MODEL'
+import json, os, sys, tempfile
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as f:
+    cfg = json.load(f)
+
+defaults = cfg.get("agents", {}).get("defaults")
+if isinstance(defaults, dict):
+    model = defaults.get("model")
+    if not isinstance(model, dict):
+        model = {}
+        defaults["model"] = model
+
+    def resolve(val):
+        """把 ${VAR} 形式解析成环境变量值；解析不出（未设置）返回 None。"""
+        if not isinstance(val, str):
+            return None
+        v = os.path.expandvars(val).strip()
+        # expandvars 对未定义变量会原样保留 ${X}，据此判定未设置
+        if not v or ("${" in v):
+            return None
+        return v
+
+    primary = resolve(model.get("primary"))
+    if primary:
+        model["primary"] = primary
+    else:
+        model.pop("primary", None)
+
+    # fallbacks 可能来自 model.fallbacks，也可能是旧版模板残留在 defaults 顶层
+    raw_fb = model.get("fallbacks")
+    if not isinstance(raw_fb, list):
+        raw_fb = []
+    legacy_fb = defaults.pop("fallbacks", None)
+    if isinstance(legacy_fb, list):
+        raw_fb = list(legacy_fb) + list(raw_fb)
+
+    fb = [r for r in (resolve(x) for x in raw_fb) if r]
+    if fb:
+        model["fallbacks"] = fb
+    else:
+        model.pop("fallbacks", None)   # 关键：不能留 [""]
+
+    # model 为空对象时删掉，免得 schema 报 model: 需要 primary
+    if not model:
+        defaults.pop("model", None)
+
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), suffix=".tmp")
+with os.fdopen(fd, "w", encoding="utf-8") as f:
+    json.dump(cfg, f, indent=2, ensure_ascii=False)
+    f.write("\n")
+os.replace(tmp, path)
+os.chown(path, 1000, 1000)
+os.chmod(path, 0o600)
+print("[model] primary=%s fallbacks=%s" % (primary or "(unset)", fb or "(none)"))
+PYEOF_MODEL
+ok "模型占位符已落值（未配置则留待控制台设置）"
+
 # ── 5. 密钥 ──
 step "5. 写入密钥"
 # 幂等：先在 .env 里查是否已有该 key（避免重跑时重复追加）。
@@ -519,6 +588,34 @@ with open(path, "w", encoding="utf-8") as f:
 print("mihomo-tun service removed (--without-mihomo)")
 PYEOF
 fi
+
+# 未启用 mihomo（海外机直连）时，模型 provider 走直连出口；Telegram 亦直连。
+# 但模板里 channels.telegram.enabled 默认为 true，若用户没配 botToken，
+# Gateway 会因空 token 反复重启。这里在启动前统一矫正：没有有效 bot token 就置 enabled=false。
+python3 - /data/state/openclaw.json "${TELEGRAM_BOT_TOKEN}" << 'PYEOF_TGDIS'
+import json, os, sys, tempfile
+path, tg_token = sys.argv[1], (sys.argv[2] if len(sys.argv) > 2 else "")
+if not os.path.exists(path):
+    sys.exit(0)
+with open(path, encoding="utf-8") as f:
+    cfg = json.load(f)
+tg = cfg.get("channels", {}).get("telegram")
+if isinstance(tg, dict):
+    # 只有真给了 token（或已存在 tokenFile）才允许 enabled=true
+    has_token = bool(tg_token.strip()) or bool(tg.get("tokenFile"))
+    if not has_token:
+        tg["enabled"] = False
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), suffix=".tmp")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+        os.replace(tmp, path)
+        os.chown(path, 1000, 1000)
+        os.chmod(path, 0o600)
+        print("[telegram] no bot token configured -> channels.telegram.enabled=false")
+    else:
+        print("[telegram] bot token present -> channels.telegram enabled")
+PYEOF_TGDIS
 
 COMPOSE_PROFILES=""
 $WITH_MIHOMO && COMPOSE_PROFILES="${COMPOSE_PROFILES} --profile mihomo"

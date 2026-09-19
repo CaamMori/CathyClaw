@@ -25,8 +25,10 @@
   },
   "agents": {
     "defaults": {
-      "model": { "primary": "${PRIMARY_MODEL}" },
-      "fallbacks": ["${FALLBACK_MODEL}"],
+      "model": {
+        "primary": "${PRIMARY_MODEL}",
+        "fallbacks": ["${FALLBACK_MODEL}"]
+      },
       "compaction": {
         "mode": "safeguard",
         "timeoutSeconds": 600,
@@ -49,9 +51,7 @@
             "env": {
               "GH_TOKEN": "${GH_TOKEN}",
               "GITHUB_TOKEN": "${GH_TOKEN}",
-              "TAVILY_API_KEY": "${TAVILY_API_KEY}",
-              "PYTHONPATH": "/opt/tools",
-              "PATH": "/opt/tools/bin:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"
+              "TAVILY_API_KEY": "${TAVILY_API_KEY}"
             }
           }
         },
@@ -68,9 +68,7 @@
           "browser": { "enabled": true, "autoStart": true },
           "docker": {
             "env": {
-              "TAVILY_API_KEY": "${TAVILY_API_KEY}",
-              "PYTHONPATH": "/opt/tools",
-              "PATH": "/opt/tools/bin:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"
+              "TAVILY_API_KEY": "${TAVILY_API_KEY}"
             }
           }
         },
