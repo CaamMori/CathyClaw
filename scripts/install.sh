@@ -21,7 +21,10 @@ INTERACTIVE=false
 PROMPT_INPUT="/dev/stdin"
 if [ -t 0 ]; then
   INTERACTIVE=true
-elif [ -r /dev/tty ] && [ -w /dev/tty ]; then
+elif [ -r /dev/tty ] && [ -w /dev/tty ] && { true < /dev/tty; } 2>/dev/null; then
+  # 注意：setsid / nohup 下 /dev/tty 权限位是通的，但实际打开会失败（无控制终端）。
+  # 因此这里必须「实际尝试打开」，只查 -r/-w 会误判为可交互，随后 read 报
+  # "/dev/tty: No such device or address"。
   INTERACTIVE=true
   PROMPT_INPUT="/dev/tty"
 fi
@@ -30,10 +33,15 @@ prompt() {
   local message="$1" variable="$2" value=""
   # stdin 本身是 TTY 时直接继承 FD 0；不要重新打开 /dev/stdin，部分移动 SSH
   # 环境会因此显示提示却无法接收键盘输入。仅重定向 stdin 时读取控制终端。
+  # 无 TTY（nohup / setsid / CI 后台运行）时 /dev/tty 不可用，直接取默认值而非报错。
   if [ "${PROMPT_INPUT}" = "/dev/tty" ]; then
-    IFS= read -r -p "${message}" value < /dev/tty || value=""
+    if [ -c /dev/tty ] && { true < /dev/tty; } 2>/dev/null; then
+      IFS= read -r -p "${message}" value < /dev/tty || value=""
+    else
+      value=""
+    fi
   else
-    IFS= read -r -p "${message}" value || value=""
+    IFS= read -r -p "${message}" value 2>/dev/null || value=""
   fi
   printf -v "${variable}" '%s' "${value}"
 }
@@ -401,12 +409,11 @@ docker pull "${GATEWAY_IMAGE}" 2>&1 | tail -3
 # 生成 docker-compose.yml（持久化，避免 /tmp 被清）
 # 用 sed 替换模板中的 YOUR_* 占位符（比 envsubst 更直观，占位符即文档）。
 COMPOSE_FILE="/data/etc/openclaw/docker-compose.yml"
-if [ -z "${OPENCLAW_VERSION:-}" ]; then OPENCLAW_VERSION="${GATEWAY_IMAGE##*/}"; fi
-if [ -z "${OPENCLAW_VERSION:-}" ]; then OPENCLAW_VERSION="YOUR_OPENCLAW_VERSION_HERE"; fi
-if [ -z "${MIHOMO_VERSION:-}" ]; then MIHOMO_VERSION="${MIHOMO_IMAGE:-latest}"; fi
+# 直接用完整镜像名替换（用户可能用任意镜像站，如 ghcr.nju.edu.cn/openclaw/openclaw:tag），
+# 不能只取 tag 拼接——那会把仓库名带进去，拼出 .../openclaw:openclaw:tag 这种非法引用。
 if [ -z "${DOCKER_GROUP_ID:-}" ]; then DOCKER_GROUP_ID="$(stat -c '%g' /var/run/docker.sock 2>/dev/null || echo 999)"; fi
-sed -e "s|YOUR_OPENCLAW_VERSION_HERE|${OPENCLAW_VERSION}|g" \
-    -e "s|YOUR_MIHOMO_VERSION_HERE|${MIHOMO_VERSION}|g" \
+sed -e "s|YOUR_GATEWAY_IMAGE|${GATEWAY_IMAGE}|g" \
+    -e "s|YOUR_MIHOMO_IMAGE|${MIHOMO_IMAGE}|g" \
     -e "s|YOUR_DOCKER_GROUP_ID|${DOCKER_GROUP_ID}|g" \
     "$PROJECT_DIR/docker-compose.yml" > "${COMPOSE_FILE}"
 # 防御：确认模板里的所有 YOUR_* 占位符都已被替换，没有残留。

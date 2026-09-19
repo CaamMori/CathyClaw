@@ -8,7 +8,7 @@
 
 services:
   openclaw-gateway:
-    image: ghcr.io/openclaw/openclaw:YOUR_OPENCLAW_VERSION_HERE
+    image: YOUR_GATEWAY_IMAGE
     container_name: openclaw-gateway
     restart: unless-stopped
     # 启动包装器：每次启动先清孤儿锁 + 幂等注入工具调用预算补丁，再按原命令启动。
@@ -58,7 +58,7 @@ services:
 
   # mihomo TUN 代理 sidecar：与 gateway 共享网络命名空间，TUN 接管容器内出站流量
   mihomo-tun:
-    image: metacubex/mihomo:YOUR_MIHOMO_VERSION_HERE
+    image: YOUR_MIHOMO_IMAGE
     container_name: mihomo-tun
     restart: unless-stopped
     profiles: ["mihomo"]
