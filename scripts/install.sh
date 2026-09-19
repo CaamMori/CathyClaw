@@ -568,38 +568,34 @@ PYEOF
 NEED_RESTART=true
 ok "Control UI 来源已允许: ${CONTROL_UI_ORIGIN}"
 
-# ── 8. Agent 自知识体系 ──
+# ── 8. SOUL + AGENTS ──
 step "8. Agent 策略"
-# 整套 agent 文档来自生产机的现役版本（不是早期手册样例）：
-#   SOUL/IDENTITY/USER/AGENTS/SELF + runbooks/ + memory/ 目录。
-# 每轮都进上下文的核心只有 SOUL/AGENTS；其余按需读，避免稀释注意力。
-AGENT_TMPL="$PROJECT_DIR/templates/agent"
-WS="/data/state/workspace"
-if [ -d "$AGENT_TMPL" ]; then
-  mkdir -p "$WS/runbooks" "$WS/memory"
-  for f in SOUL.md IDENTITY.md USER.md AGENTS.md AGENT-ROADMAP.md SELF.md; do
-    [ -f "$AGENT_TMPL/$f" ] && cp "$AGENT_TMPL/$f" "$WS/$f"
-  done
-  cp "$AGENT_TMPL"/runbooks/*.md "$WS/runbooks/" 2>/dev/null || true
-  # 渲染占位符：agent 名 / 所有者 / guest / 服务器 IP
-  if command -v sed >/dev/null 2>&1; then
-    for f in "$WS"/*.md "$WS"/runbooks/*.md; do
-      sed -i \
-        -e "s|\${AGENT_NAME}|${AGENT_NAME:-Mori}|g" \
-        -e "s|\${OWNER_NAME}|${OWNER_NAME:-admin}|g" \
-        -e "s|\${OWNER_TELEGRAM_ID}|${OWNER_TELEGRAM_ID:-}|g" \
-        -e "s|\${GUEST_NAME}|${GUEST_NAME:-guest}|g" \
-        -e "s|\${GUEST_TELEGRAM_ID}|${GUEST_TELEGRAM_ID:-}|g" \
-        -e "s|\${SERVER_IP}|${SERVER_IP:-YOUR_SERVER_IP}|g" \
-        -e "s|\${GATEWAY_LAN_IP}|${GATEWAY_LAN_IP:-172.17.0.1}|g" \
-        "$f" 2>/dev/null || true
-    done
-  fi
-  chown -R 1000:1000 "$WS"
-  ok "Agent 自知识体系已就位（SOUL/IDENTITY/USER/AGENTS/SELF + runbooks）"
-else
-  warn "未找到 templates/agent，跳过策略文件"
-fi
+cp "$PROJECT_DIR/templates/SOUL.md" /data/workspace/SOUL.md 2>/dev/null || cat > /data/workspace/SOUL.md << 'SOUL'
+# Administrator Execution Mode
+## Identity
+私人高级运维工程师。任务：理解目标 → 分析环境 → 执行操作 → 验证结果 → 交付可用。
+## Rules
+- 管理员任务最高优先级
+- 禁止输出 token / 密钥 / 密码
+- 可逆操作直接执行，不可逆必须确认
+- 不确定按不可逆处理
+SOUL
+
+cp "$PROJECT_DIR/templates/AGENTS.md" /data/workspace/AGENTS.md 2>/dev/null || cat > /data/workspace/AGENTS.md << 'AGENTS'
+# Private Dev Agent Policy
+## Core
+管理员指令最高优先级。
+## Secrets
+禁止输出 API Key / Token / 密码。汇报只告知文件路径。
+## Risk
+- 可逆操作：直接执行。
+- 不可逆操作：必须确认。
+- 不确定的按不可逆处理。
+## Execution
+- 容器以非 root 运行，host 级操作受 Docker 安全边界限制。
+- 所有操作通过 Gateway 审计日志记录。
+AGENTS
+ok "策略文件已写入"
 
 # ── 9. 备份 ──
 step "9. 备份"

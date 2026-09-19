@@ -55,7 +55,6 @@ sudo ./scripts/install.sh --help
 
 ## 文档
 
-- [从零部署方法论](docs/deploy-from-scratch.md)
 - [部署指南](docs/deployment.md)
 - [运维手册](docs/ops.md)
 - [安全模型](docs/security.md)
