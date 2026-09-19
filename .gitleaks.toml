@@ -1,0 +1,74 @@
+# Gitleaks 配置 — 针对 CathyClaw 的实际泄漏面调校
+#
+# 为什么需要自定义：默认规则对"Telegram bot id / token"覆盖不全，
+# 而本项目恰恰在那里出过真实泄漏（.env.example 里写过一个真实 bot id）。
+# 通用规则还会把文档里的示例值报成误报，噪声大了就没人看告警了。
+
+title = "CathyClaw secrets policy"
+
+[extend]
+# 保留 Gitleaks 内置规则集，再补充本项目特有的
+useDefault = true
+
+[[rules]]
+id = "telegram-bot-token"
+description = "Telegram Bot Token（形如 123456789:AA... ，泄露即可完全接管 bot）"
+# bot token = <bot_id>:<35 位 base64url-ish>
+regex = '''\b[0-9]{8,12}:[A-Za-z0-9_-]{35}\b'''
+tags = ["secret", "telegram", "credential"]
+keywords = ["telegram", "bot_token", "BOT_TOKEN", "TELEGRAM_BOT_TOKEN"]
+
+[[rules]]
+id = "telegram-bot-id-plain"
+description = "裸 Telegram bot id（非 token，但属于个人标识，不应进仓库）"
+regex = '''(?i)(telegram[_-]?(bot[_-]?)?(id|chat[_-]?id)|allowed[_-]?chat[_-]?id)\s*[:=]\s*['"]?[0-9]{8,12}['"]?'''
+tags = ["pii", "telegram"]
+keywords = ["telegram", "chat_id", "bot_id"]
+
+[[rules]]
+id = "openclaw-gateway-token"
+description = "OpenClaw Gateway 访问令牌"
+# 注意：Go 的 regexp（RE2）不支持负向前瞻 (?!...)，只能用 allowlist 排除占位符。
+# 这条弯路踩过：写 (?!YOUR_) 会让 gitleaks 直接 panic: invalid or unsupported Perl syntax。
+regex = '''(?i)(OPENCLAW_GATEWAY_TOKEN|gateway[_-]?token)\s*[:=]\s*['"]?([A-Za-z0-9_\-]{16,})['"]?'''
+tags = ["secret", "openclaw"]
+keywords = ["OPENCLAW_GATEWAY_TOKEN", "gateway_token"]
+
+# 占位符不算泄露：示例模板里本来就该出现这些写法，且必须能通过扫描，
+# 否则开发者会把扫描当作噪声而关掉它。
+[[rules.allowlists]]
+description = "占位符/示例值（YOUR_xxx_HERE、<...>、CHANGEME 等）"
+# 两处踩坑记录：
+#  ① Go regexp（RE2）不支持负向前瞻 (?!...)，写进主正则会直接 panic；
+#  ② allowlist 默认比对的是【捕获到的 secret 本身】，不是整行。
+#     这里 regexTarget 必须显式指定（"line" 比 "match" 更稳，
+#     因为占位词常出现在键名一侧而非 secret 一侧）。
+regexTarget = "line"
+regexes = [
+  '''(?i).*(YOUR_[A-Z0-9_]*_?HERE|CHANGEME|REPLACE_ME|PLACEHOLDER|EXAMPLE|DUMMY|XXX+).*''',
+  '''.*<[^>]*>.*''',
+]
+
+[[rules]]
+id = "model-provider-api-key"
+description = "模型 Provider API Key（sk-/sk-ant- 等）"
+regex = '''\b(sk-[A-Za-z0-9]{20,}|sk-ant-[A-Za-z0-9_\-]{20,}|AIza[A-Za-z0-9_\-]{35})\b'''
+tags = ["secret", "api-key"]
+keywords = ["sk-", "api_key", "apikey"]
+
+[[rules]]
+id = "generic-private-key"
+description = "私钥文件内容"
+regex = '''-----BEGIN (RSA |EC |OPENSSH |PGP )?PRIVATE KEY-----'''
+tags = ["secret", "private-key"]
+
+[allowlist]
+description = "示例/占位/文档中的非真实值"
+# 明确允许的假值——避免 CI 被示例文案刷屏，告警失去意义
+regexes = [
+  '''(?i)(your[_-]?(token|key|id)|xxx+|placeholder|example|dummy|changeme|todo|<[^>]+>)''',
+  '''(?i)8524071159\s*#\s*已轮换''',   # 若历史里保留"已披露并轮换"的说明性注释
+]
+paths = [
+  '''(^|/)\.github/workflows/.*\.ya?ml$''',   # 工作流里写成 ${{ secrets.X }} 的引用
+]

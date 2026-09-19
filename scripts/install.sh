@@ -229,10 +229,8 @@ if [ "${MIHOMO_AUTO_DETECT}" = "1" ] && ! $MIHOMO_DECIDED; then
   if ! curl -fsS -o /dev/null --max-time 6 https://github.com 2>/dev/null; then
     info "直连 GitHub 失败 → 判定为境内机，自动启用 mihomo 出海代理"
     WITH_MIHOMO=true
-    MIHOMO_AUTO_ENABLED=true
   else
     info "直连 GitHub 正常 → 判定为海外机，跳过 mihomo（直连即出口）"
-    MIHOMO_AUTO_ENABLED=false
   fi
 fi
 # 交互安装时让用户直接提供域名；该值同时用于 Nginx、Let's Encrypt 与 Control UI 来源白名单。

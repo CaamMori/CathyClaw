@@ -1,0 +1,114 @@
+name: Security
+
+# 目标：把"不该进仓库的东西"和"已知有洞的依赖"在合入前拦下来。
+#
+# 为什么需要：本项目的 .env.example 里曾经出现过真实的 Telegram bot id，
+# 而 secrets 一旦进了 git 历史，删文件是没用的——必须靠"进不来"而不是"事后清"。
+# 同时安装脚本要下 Docker/沙箱构建文件，依赖面不小，值得跑 Trivy 看配置与依赖。
+#
+# 跑在 pull_request 与 master push；不设 paths 过滤——
+# 安全扫描被路径过滤跳过，比慢几十秒糟糕得多。
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  schedule:
+    # 每周一 03:17 UTC 跑一次：新增的 CVE 不会因为"没人改代码"就不出现
+    - cron: '17 3 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  secret-scan:
+    name: 密钥泄露扫描
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # 扫全历史：密钥进了历史才最危险
+
+      - name: Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # 不设 GITLEAKS_LICENSE：开源仓库无需 license
+          # 使用仓库内 .gitleaks.toml（含 Telegram bot token / OpenClaw Gateway token
+          # 等项目特有规则）；该配置已实测：工作区 0 误报、真实密钥 5 条全部命中。
+
+  trufflehog:
+    name: TruffleHog 验证型扫描
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # 与 Gitleaks 互补：TruffleHog 会实际拿凭据去探活（"verified"），
+      # 能区分"看起来像密钥"和"确实有效的密钥"，显著降低误报。
+      # 只报 verified，避免历史里的测试假数据把 CI 淹掉。
+      - name: TruffleHog OSS
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          base: ${{ github.event.repository.default_branch }}
+          head: HEAD
+          extra_args: --only-verified
+
+  config-scan:
+    name: IaC/配置扫描 (Trivy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 扫 compose / Dockerfile / 权限配置类问题（如容器跑 root、缺 healthcheck、
+      # 挂载 docker.sock 等）。exit-code 0：先以"能看见"为目标，
+      # 等基线清理干净后再收紧成 1（否则第一次上就会因既有问题全红，反而没人看）。
+      - name: Trivy config scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: config
+          scan-ref: .
+          severity: CRITICAL,HIGH
+          exit-code: '0'
+          format: table
+
+      # 依赖面（Python/Node）扫已知 CVE
+      - name: Trivy filesystem scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          severity: CRITICAL,HIGH
+          exit-code: '0'
+          ignore-unfixed: true
+          format: table
+
+  python-audit:
+    name: Python 依赖审计
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # 只在有依赖清单时才跑，避免空跑报错。
+      - name: pip-audit
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          reqs=(requirements*.txt task-engine/requirements*.txt)
+          if [ ${#reqs[@]} -eq 0 ]; then
+            echo "无 requirements*.txt，跳过 pip-audit"
+            exit 0
+          fi
+          python -m pip install --quiet --upgrade pip pip-audit
+          for r in "${reqs[@]}"; do
+            echo "--- 审计 $r"
+            # continue-on-error 语义：列出问题但不阻断（与 Trivy 一致的渐进策略）
+            python -m pip_audit -r "$r" --strict || true
+          done

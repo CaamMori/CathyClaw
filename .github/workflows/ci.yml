@@ -35,3 +35,30 @@ jobs:
             fi
           done < <(find scripts -name '*.sh' -type f | sort)
           exit $fail
+
+  task-engine-test:
+    # 此前 task-engine 有 74 个测试却从没在 CI 里跑过——等于没有回归保护。
+    # 注意：这里跑的是仓库内的测试副本，它用 TASK_ENGINE_HOME 指向临时目录做隔离；
+    # te-daemon 读的是自己的 TE_DIR，不会干扰测试。
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安装依赖
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet --upgrade pip
+          # 测试用到 pytest；其余为标准库
+          python -m pip install --quiet pytest
+
+      - name: 运行 task-engine 测试
+        run: |
+          set -euo pipefail
+          cd task-engine
+          # TE_TEST_TIMEOUT 放宽到 30s：CI runner 比本机慢，
+          # 而部分用例要起子进程读 task.json，默认 15s 在慢机上会偶发超时。
+          TE_TEST_TIMEOUT=30 python -m pytest tests/ -q
