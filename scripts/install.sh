@@ -136,12 +136,18 @@ if [ -f .env ]; then
   # 只提取合法 KEY=VALUE 行（允许空值，如 GATEWAY_MEM_LIMIT=），忽略注释/空行/非法行。
   # 逐行 export 而非 `set -a; source`：避免 (1) set -a 把所有变量全局导出污染后续子进程；
   # (2) source 对 .env 里意外出现的 export 语句/多行值/特殊字符产生副作用。
-  # 注意：值不做 # 修剪，避免误删合法的 # 字符；注释以行首 # 区分。
+  #
+  # 行尾注释：仅在「空白 + #」时剥离。这样 `DOCKER_GROUP_ID=999  # 说明` 会正确取到 999，
+  # 而值里自带的 #（如 `PASS=a#b`）不受影响。剥离后两端去空白。
+  # 这曾是真实事故：模板里的行尾注释被当成值的一部分传给 docker，报
+  #   "unable to find group 999  # stat -c ...: no matching entries in group file"
   while IFS='=' read -r key value; do
     case "${key}" in
       ''|\#*) continue ;;  # 空键或注释行，跳过
       *[!A-Za-z0-9_]*) continue ;;  # 非法键名，跳过
     esac
+    # 剥离行尾注释（空白 + # 起），再去掉首尾空白
+    value="$(printf '%s' "${value}" | sed -E 's/[[:space:]]+#.*$//' | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
     export "${key}=${value}"
   done < <(grep -E '^[A-Za-z_][A-Za-z0-9_]*=' .env)
   info "已加载 .env"
@@ -497,7 +503,16 @@ fi
 COMPOSE_FILE="/data/etc/openclaw/docker-compose.yml"
 # 直接用完整镜像名替换（用户可能用任意镜像站，如 ghcr.nju.edu.cn/openclaw/openclaw:tag），
 # 不能只取 tag 拼接——那会把仓库名带进去，拼出 .../openclaw:openclaw:tag 这种非法引用。
-if [ -z "${DOCKER_GROUP_ID:-}" ]; then DOCKER_GROUP_ID="$(stat -c '%g' /var/run/docker.sock 2>/dev/null || echo 999)"; fi
+#
+# DOCKER_GROUP_ID 必须是纯数字：Compose 会把它当 GID 解析，非数字会以
+#   "unable to find group <值>: no matching entries in group file"
+# 直接拒绝启动整个 stack。空值或非数字一律回退到实测 socket 属组。
+DOCKER_GROUP_ID="$(printf '%s' "${DOCKER_GROUP_ID:-}" | tr -d '[:space:]')"
+if ! printf '%s' "${DOCKER_GROUP_ID}" | grep -qE '^[0-9]+$'; then
+  AUTODETECTED_GID="$(stat -c '%g' /var/run/docker.sock 2>/dev/null || echo 999)"
+  [ -n "${DOCKER_GROUP_ID}" ] && warn "DOCKER_GROUP_ID='${DOCKER_GROUP_ID}' 非数字，已回退为实测 ${AUTODETECTED_GID}"
+  DOCKER_GROUP_ID="${AUTODETECTED_GID}"
+fi
 # Telegram API 死 IP：仅境内机（TUN 模式）需要钉住防 DNS 污染；海外机直连不需要。
 TELEGRAM_API_IP=""
 if $WITH_MIHOMO; then
