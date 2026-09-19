@@ -49,7 +49,6 @@ def create(args):
         taskdir.mkdir(mode=0o700)
     except FileExistsError:
         raise ValueError("task already exists")
-    os.chmod(taskdir, 0o700)  # 显式设置，避免 umask 削成 755
     path = taskdir / "task.json"
     t = now()
     task = {"id":tid,"goal":args.goal,"acceptance":args.acceptance,
@@ -108,15 +107,13 @@ def execute(argv, timeout, log_path, hb_path=None):
     def _hb_loop():
         # 每 10s 刷新心跳；worker 被 SIGKILL 后心跳自然停止 -> 外部可判定死亡
         while not stop_hb.wait(10):
-            heartbeat(hb_path, "running", {"pgid": pgid})
+            heartbeat(hb_path, "running", {"pgid": pgid_ref[0]})
 
-    # 实际命令与 worker wrapper 保持在同一个 process group/session。
-    # worker wrapper 由 run_task() 以 start_new_session=True 启动，已是 group/session leader。
-    # 这里不创建新 session，子进程自动继承 worker wrapper 的 pgid，
-    # 这样外部 signal_owned_group(data["pid"]) 才能同时终止 wrapper 和真正任务进程。
-    pgid = os.getpgid(0)
+    pgid_ref = [None]
     with os.fdopen(fd, "ab", buffering=0) as out:
-        child = subprocess.Popen(argv, stdout=out, stderr=subprocess.STDOUT)
+        child = subprocess.Popen(argv, stdout=out, stderr=subprocess.STDOUT, start_new_session=True)
+        pgid = child.pid  # start_new_session guarantees a worker-owned session/group.
+        pgid_ref[0] = pgid
         if hb_path is not None:
             heartbeat(hb_path, "running", {"pgid": pgid})
             threading.Thread(target=_hb_loop, daemon=True).start()
@@ -306,45 +303,32 @@ def reap(args):
     for path, data in targets:
         if data.get("status") not in ("orphaned",):
             continue
-        lock_path = path.parent / "run.lock"
-        with open_lock(lock_path) as lock:
-            try:
-                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                continue  # 任务正在操作，跳过，避免与 running worker 竞态
-            # 加锁后重新加载，防止状态已被其他进程更新
-            try:
-                path, data = load(path.parent.name)
-            except Exception:
-                continue
-            if data.get("status") not in ("orphaned",):
-                continue
-            # 再确认一次确实没人活着，避免误杀健康的 running->_orphan 竞态
-            if pid_matches(data):
-                continue
-            hb = hb_age(path.parent)
-            if hb is not None and hb <= HEARTBEAT_STALE:
-                continue  # 心跳仍新鲜，可能在交接中，放过
-            if args.dry_run:
-                reaped.append((data.get("id"), "DRY-RUN"))
-                continue
-            data.update(
-                status="failed",
-                exit_code=-9,
-                pid=None,
-                finished_at=data.get("orphan_detected_at") or now(),
-                failure_reason="orphaned_worker_reaped",
-                killed_by="external_signal (worker was terminated, no exit code recorded)",
-                hb_age=None if hb is None else round(hb, 1),
-            )
-            save(path, data)
-            # 心跳文件标记为终态，防止后续误判
-            try:
-                heartbeat(path.parent / "heartbeat.json", "failed_reaped")
-            except Exception:
-                pass
-            reaped.append((data.get("id"), "REAPED"))
-            print(f"reaped {data.get('id')} -> failed(-9) reason=orphaned_worker_reaped")
+        # 再确认一次确实没人活着，避免误杀健康的 running->_orphan 竞态
+        if pid_matches(data):
+            continue
+        hb = hb_age(path.parent)
+        if hb is not None and hb <= HEARTBEAT_STALE:
+            continue  # 心跳仍新鲜，可能在交接中，放过
+        if args.dry_run:
+            reaped.append((data.get("id"), "DRY-RUN"))
+            continue
+        data.update(
+            status="failed",
+            exit_code=-9,
+            pid=None,
+            finished_at=data.get("orphan_detected_at") or now(),
+            failure_reason="orphaned_worker_reaped",
+            killed_by="external_signal (worker was terminated, no exit code recorded)",
+            hb_age=None if hb is None else round(hb, 1),
+        )
+        save(path, data)
+        # 心跳文件标记为终态，防止后续误判
+        try:
+            heartbeat(path.parent / "heartbeat.json", "failed_reaped")
+        except Exception:
+            pass
+        reaped.append((data.get("id"), "REAPED"))
+        print(f"reaped {data.get('id')} -> failed(-9) reason=orphaned_worker_reaped")
 
     if not reaped:
         print("nothing to reap")
@@ -386,10 +370,6 @@ def reset(args):
                     verification_exit_code=None, verified_at=None,
                     verification_mode=None, verification_argv=None,
                     accept_reason=None,
-                    # 清理上一次运行/失败/孤儿遗留的终态字段，避免误导
-                    exit_code=None, finished_at=None, worker_error=None,
-                    failure_reason=None, killed_by=None,
-                    orphan_detected_at=None, orphan_reason=None, hb_age=None,
                     reset_from=prev, reset_at=now(),
                     reset_count=int(data.get("reset_count") or 0) + 1)
         if getattr(args, "reason", None): data["reset_reason"] = args.reason

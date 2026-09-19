@@ -1,85 +1,55 @@
-#!/usr/bin/env bash
-# ============================================================
-# mihomo-guard.sh - Auto-switch proxy nodes on failure
-# ============================================================
-# Detects dead proxy nodes and switches to best available.
-# Run via cron: */5 * * * * /usr/local/bin/mihomo-guard.sh
-#
-# Requires: docker + curl + python3 on the docker HOST (queries mihomo external-controller on 127.0.0.1:9090)
-# ============================================================
+#!/bin/bash
+# mihomo-guard.sh v2 — 模型 API 出口连通守护
+# 每 2 分钟探测；连续 2 次失败自动切节点；自愈失败且全死持续 6 分钟 → 推一次 Telegram 告警（恢复后自动解除）。
+GW=openclaw-gateway
+# 模型 API 出口探测地址（改成你的模型网关 /health 或 /v1/models 端点）
+PROBE_URL="${MODEL_API_PROBE_URL:-https://your-model-gateway.example.com/v1/models}"
+# 告警推送目标：优先用环境变量 TE_ALERT_TARGET，缺省回退到占位符（请替换为你的 Telegram user ID）
+TARGET="${TE_ALERT_TARGET:-YOUR_TELEGRAM_USER_ID}"
+STATE=/var/run/mihomo-guard.fail
+DEAD=/var/run/mihomo-guard.alldead
+LOG=/var/log/mihomo-guard.log
 
-set -euo pipefail
+log() { echo "$(date '+%F %T') $*" >> "$LOG"; }
+notify() { docker exec "$GW" openclaw message send --channel telegram --target "$TARGET" -m "$1" >/dev/null 2>&1; }
 
-MIHOMO="mihomo-tun"
-GROUP="${MIHOMO_PROXY_GROUP:-main-proxy}"  # set MIHOMO_PROXY_GROUP env var or edit here
-LOG="/var/log/mihomo-guard.log"
-MAX_LOG=5120  # KB
-
-log() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG"
+probe() {
+  code=$(docker exec "$GW" curl -s -o /dev/null -w '%{http_code}' --max-time 8 "$PROBE_URL" 2>/dev/null)
+  [ -n "$code" ] && [ "$code" != "000" ]
 }
 
-rotate_log() {
-    if [ -f "$LOG" ] && [ "$(stat -c%s "$LOG" 2>/dev/null || echo 0)" -gt "$((MAX_LOG * 1024))" ]; then
-        mv "$LOG" "${LOG}.old"
-        log "Log rotated"
-    fi
-}
+if probe; then
+  [ -f "$STATE" ] && rm -f "$STATE"
+  if [ -f "$DEAD" ]; then
+    rm -f "$DEAD" "$DEAD.notified"
+    log "出口已恢复"
+    notify "[mihomo-guard] 模型API出口已恢复 ✅"
+  fi
+  exit 0
+fi
 
-# Check if mihomo is running
-if ! docker ps --format '{{.Names}}' | grep -q "$MIHOMO"; then
-    log "WARN: $MIHOMO not running, attempting restart"
-    docker restart "$MIHOMO" 2>/dev/null || true
+n=$(cat "$STATE" 2>/dev/null || echo 0)
+n=$((n+1))
+echo "$n" > "$STATE"
+log "探测失败($n): code=${code:-none}"
+[ "$n" -lt 2 ] && exit 0
+
+rm -f "$STATE"
+if /usr/local/bin/mihomo-autoswitch.sh >> "$LOG" 2>&1; then
+  sleep 3
+  if probe; then
+    log "自动切换成功,复验通过"
     exit 0
+  fi
+  log "切换后仍失败"
 fi
 
-# Get current active proxy
-ACTIVE=$(curl -s http://127.0.0.1:9090/proxies/$GROUP 2>/dev/null     | python3 -c "import sys,json; print(json.load(sys.stdin).get('now',''))" 2>/dev/null || echo "")
-
-if [ -z "$ACTIVE" ]; then
-    log "WARN: Cannot get active proxy from $GROUP"
-    exit 1
+d=$(cat "$DEAD" 2>/dev/null || echo 0)
+d=$((d+1))
+echo "$d" > "$DEAD"
+log "自愈失败($d)"
+if [ "$d" -ge 3 ] && [ ! -f "$DEAD.notified" ]; then
+  touch "$DEAD.notified"
+  log "全部节点不可用,推送告警"
+  notify "[mihomo-guard] ⚠️ 机场节点全部不可用(约 $((d*2)) 分钟),模型API不通,agent 无法响应。节点恢复后本守护会自动切换并通知。"
 fi
-
-# Test connectivity through proxy (use a fast endpoint)
-HTTP_CODE=$(curl -s -o /dev/null -w '%{http_code}'     --max-time 10 --proxy http://127.0.0.1:7890     http://cp.cloudflare.com/generate_204 2>/dev/null || echo "000")
-
-if [ "$HTTP_CODE" = "204" ] || [ "$HTTP_CODE" = "200" ]; then
-    # All good, just log and rotate
-    rotate_log
-    exit 0
-fi
-
-# Failed - try switching to next node
-log "WARN: Proxy test failed (HTTP $HTTP_CODE) for $ACTIVE"
-
-# Get all proxies in group and try next
-PROXIES=$(curl -s http://127.0.0.1:9090/proxies/$GROUP 2>/dev/null     | python3 -c "
-import sys, json
-data = json.load(sys.stdin)
-all_p = data.get('all', [])
-now = data.get('now', '')
-idx = next((i for i,p in enumerate(all_p) if p.get('name')==now), 0)
-# Try next 3 proxies
-for i in range(1, min(4, len(all_p))):
-    p = all_p[(idx+i) % len(all_p)]
-    if p.get('type') != 'Selector':
-        print(p['name'])
-" 2>/dev/null || echo "")
-
-for NODE in $PROXIES; do
-    log "Trying: $NODE"
-    curl -s -X PUT http://127.0.0.1:9090/proxies/$GROUP         -H 'Content-Type: application/json'         -d "{"name":"$NODE"}" >/dev/null 2>&1
-
-    sleep 2
-    NEW_CODE=$(curl -s -o /dev/null -w '%{http_code}'         --max-time 10 --proxy http://127.0.0.1:7890         http://cp.cloudflare.com/generate_204 2>/dev/null || echo "000")
-
-    if [ "$NEW_CODE" = "204" ] || [ "$NEW_CODE" = "200" ]; then
-        log "OK: Switched to $NODE (HTTP $NEW_CODE)"
-        exit 0
-    fi
-done
-
-log "CRITICAL: All nodes failed. Current: $ACTIVE"
-rotate_log
-exit 1

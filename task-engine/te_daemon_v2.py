@@ -25,12 +25,7 @@ TE_DIR = Path(os.environ.get(
 TASKS = TE_DIR / "tasks"
 INTERVAL = float(os.environ.get("TE_INTERVAL", "30"))
 STALL_SECS = float(os.environ.get("TE_STALL_SECS", "600"))   # 10 分钟无进展视为停滞
-# 告警目标 Telegram 账号/聊天 ID；不要硬编码，通过环境变量注入。
-# 部署前必须设置 TE_ALERT_TARGET，否则通知会发到占位示例 ID。
-ALERT_TARGET = os.environ.get("TE_ALERT_TARGET")
-if not ALERT_TARGET:
-    print("[te-daemon] WARN: TE_ALERT_TARGET not set; notifications disabled", file=sys.stderr)
-    ALERT_TARGET = ""
+ALERT_TARGET = os.environ.get("TE_ALERT_TARGET", "YOUR_TELEGRAM_USER_ID")
 GW = "openclaw-gateway"
 STATE_FILE = Path("/var/run/te-daemon.state.json")
 TG_LAST = [0.0]  # 上次推送时间戳（去抖用）
@@ -43,9 +38,6 @@ def log(msg):
 
 def send_telegram(text):
     """经容器内 gateway 推送；失败仅记日志。"""
-    if not ALERT_TARGET:
-        log("skip telegram: TE_ALERT_TARGET not set")
-        return False
     try:
         subprocess.run(
             ["timeout", "25", "docker", "exec", GW, "openclaw", "message", "send",

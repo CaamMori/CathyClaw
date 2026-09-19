@@ -1,15 +1,21 @@
 {
-  "meta": { "lastTouchedVersion": "2026.9.4" },
+  "meta": { "lastTouchedVersion": "YOUR_OPENCLAW_VERSION_HERE" },
   "gateway": {
     "mode": "local",
     "port": 18789,
-    "bind": "127.0.0.1",
-    "auth": { "token": "${OPENCLAW_GATEWAY_TOKEN}" }
+    "bind": "loopback",
+    "auth": { "token": "${OPENCLAW_GATEWAY_TOKEN}" },
+    "controlUi": {
+      "allowedOrigins": [
+        "http://127.0.0.1:18789",
+        "http://localhost:18789"
+      ]
+    }
   },
   "channels": {
     "telegram": {
       "enabled": true,
-      "tokenFile": "/data/etc/openclaw/telegram/bot-token",
+      "botToken": "${TELEGRAM_BOT_TOKEN}",
       "allowFrom": ["tg:${TELEGRAM_OWNER_ID}"],
       "streaming": "partial"
     }
@@ -18,23 +24,59 @@
     "ownerAllowFrom": ["telegram:${TELEGRAM_OWNER_ID}"]
   },
   "agents": {
+    "defaults": {
+      "model": { "primary": "${PRIMARY_MODEL}" },
+      "fallbacks": ["${FALLBACK_MODEL}"],
+      "compaction": {
+        "mode": "safeguard",
+        "timeoutSeconds": 600,
+        "keepRecentTokens": 20000,
+        "postIndexSync": "async",
+        "notifyUser": false
+      },
+      "thinkingDefault": "off",
+      "verboseDefault": "off",
+      "timeoutSeconds": 600
+    },
+    "ownership": "explicit",
     "entries": {
       "main": {
         "name": "Main",
+        "workspace": "/home/node/.openclaw/workspace",
         "identity": { "emoji": "🌙" },
+        "sandbox": {
+          "docker": {
+            "env": {
+              "GH_TOKEN": "${GH_TOKEN}",
+              "GITHUB_TOKEN": "${GH_TOKEN}",
+              "TAVILY_API_KEY": "${TAVILY_API_KEY}",
+              "PYTHONPATH": "/opt/tools",
+              "PATH": "/opt/tools/bin:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"
+            }
+          }
+        },
         "tools": {
           "elevated": {
             "allowFrom": { "telegram": ["tg:${TELEGRAM_OWNER_ID}"] }
           }
         }
+      },
+      "guest": {
+        "name": "Guest",
+        "workspace": "~/.openclaw/workspace-guest",
+        "sandbox": {
+          "browser": { "enabled": true, "autoStart": true },
+          "docker": {
+            "env": {
+              "TAVILY_API_KEY": "${TAVILY_API_KEY}",
+              "PYTHONPATH": "/opt/tools",
+              "PATH": "/opt/tools/bin:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"
+            }
+          }
+        },
+        "tools": { "deny": ["canvas", "cron", "nodes"] },
+        "identity": { "emoji": "🌿" }
       }
-    },
-    "defaults": {
-      "model": { "primary": "${PRIMARY_MODEL}" },
-      "fallbacks": [],
-      "compaction": { "mode": "safeguard", "timeoutSeconds": 120 },
-      "streaming": { "mode": "partial" },
-      "timeoutSeconds": 40
     }
   },
   "models": {

@@ -167,14 +167,10 @@ def all_summary(tasks):
     return "📋 任務日報\n" + "\n".join(lines)
 
 
-def push_telegram(text, target=None):
+def push_telegram(text, target="YOUR_TELEGRAM_USER_ID"):
     """经 gateway CLI 把文本真正推送到 Telegram。"""
     import shutil
     import subprocess
-    target = target or os.environ.get("TE_ALERT_TARGET") or ""
-    if not target:
-        print("⚠ TE_ALERT_TARGET not set, skip telegram push", file=sys.stderr)
-        return 1
     exe = shutil.which("openclaw")
     cmd = None
     if exe:
@@ -207,8 +203,8 @@ def main(argv=None):
         description="OpenClaw 任务看板与汇报（数据源：taskctl.py 的 tasks/ 目录）")
     p.add_argument("--json", action="store_true", help="以 JSON 输出全部任务")
     p.add_argument("--html", metavar="PATH", help="输出 HTML 看板到文件")
-    p.add_argument("--telegram", metavar="TARGET", nargs="?", const="",
-                   help="生成摘要并推送到 Telegram（可指定 target；缺省从 TE_ALERT_TARGET 读取）")
+    p.add_argument("--telegram", metavar="TARGET", nargs="?", const="YOUR_TELEGRAM_USER_ID",
+                   help="生成摘要并推送到 Telegram（可指定 target，默认 YOUR_TELEGRAM_USER_ID）")
     p.add_argument("--summary", action="store_true", help="打印总体进度摘要（不推送）")
     p.add_argument("--one", metavar="ID", help="打印单个任务的简洁汇报")
     args = p.parse_args(argv)

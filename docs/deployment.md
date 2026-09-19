@@ -48,6 +48,6 @@ sudo ./scripts/install.sh
 
 ```bash
 docker ps
-docker logs cakeclaw-gateway --tail 50
+docker logs openclaw-gateway --tail 50
 /usr/local/bin/selfcheck.py --full
 ```

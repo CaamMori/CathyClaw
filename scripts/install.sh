@@ -383,15 +383,19 @@ step "6. 部署 Gateway"
 docker pull "${GATEWAY_IMAGE}" 2>&1 | tail -3
 
 # 生成 docker-compose.yml（持久化，避免 /tmp 被清）
-export GATEWAY_PORT GATEWAY_IMAGE GATEWAY_MEM_LIMIT GATEWAY_CPU_LIMIT GATEWAY_PID_LIMIT MIHOMO_IMAGE DOCKER_GROUP_ID
+# 用 sed 替换模板中的 YOUR_* 占位符（比 envsubst 更直观，占位符即文档）。
 COMPOSE_FILE="/data/etc/openclaw/docker-compose.yml"
-envsubst '$GATEWAY_PORT $GATEWAY_IMAGE $GATEWAY_MEM_LIMIT $GATEWAY_CPU_LIMIT $GATEWAY_PID_LIMIT $MIHOMO_IMAGE $DOCKER_GROUP_ID' \
-  < "$PROJECT_DIR/docker-compose.yml" > "${COMPOSE_FILE}"
-# 防御：确认模板里的所有 ${VAR} 都已被替换，没有残留占位符。
-# 若未来有人在 docker-compose.yml 新增变量却忘了同步 envsubst 列表，
-# 残留的 ${XXX} 会变成字面量导致 compose 启动异常，这里提前拦截。
-if grep -qE '\$\{[A-Za-z_][A-Za-z0-9_]*\}' "${COMPOSE_FILE}"; then
-  fail "docker-compose 生成失败：存在未替换的占位符，请同步 envsubst 变量列表。残留: $(grep -oE '\$\{[A-Za-z_][A-Za-z0-9_]*\}' "${COMPOSE_FILE}" | sort -u | tr '\n' ' ')"
+if [ -z "${OPENCLAW_VERSION:-}" ]; then OPENCLAW_VERSION="${GATEWAY_IMAGE##*/}"; fi
+if [ -z "${OPENCLAW_VERSION:-}" ]; then OPENCLAW_VERSION="YOUR_OPENCLAW_VERSION_HERE"; fi
+if [ -z "${MIHOMO_VERSION:-}" ]; then MIHOMO_VERSION="${MIHOMO_IMAGE:-latest}"; fi
+if [ -z "${DOCKER_GROUP_ID:-}" ]; then DOCKER_GROUP_ID="$(stat -c '%g' /var/run/docker.sock 2>/dev/null || echo 999)"; fi
+sed -e "s|YOUR_OPENCLAW_VERSION_HERE|${OPENCLAW_VERSION}|g" \
+    -e "s|YOUR_MIHOMO_VERSION_HERE|${MIHOMO_VERSION}|g" \
+    -e "s|YOUR_DOCKER_GROUP_ID|${DOCKER_GROUP_ID}|g" \
+    "$PROJECT_DIR/docker-compose.yml" > "${COMPOSE_FILE}"
+# 防御：确认模板里的所有 YOUR_* 占位符都已被替换，没有残留。
+if grep -qE 'YOUR_[A-Z_]+' "${COMPOSE_FILE}"; then
+  fail "docker-compose 生成失败：存在未替换的占位符。残留: $(grep -oE 'YOUR_[A-Z_]+' "${COMPOSE_FILE}" | sort -u | tr '\n' ' ')"
 fi
 chmod 600 "${COMPOSE_FILE}"
 
@@ -407,7 +411,6 @@ in_gateway_volumes = False
 for line in lines:
     stripped = line.strip()
     if stripped == "volumes:" and line.startswith("    "):
-        # 粗略定位 gateway 服务的 volumes 段（4空格缩进）
         in_gateway_volumes = True
         filtered.append(line)
         continue
@@ -420,6 +423,22 @@ for line in lines:
 with open(path, "w", encoding="utf-8") as f:
     f.writelines(filtered)
 print("docker.sock mount removed (--without-sandbox)")
+PYEOF
+fi
+
+# 若未启用 mihomo，移除 mihomo-tun 服务块（含 profiles: ["mihomo"]）
+if ! $WITH_MIHOMO; then
+  python3 - "${COMPOSE_FILE}" << 'PYEOF'
+import sys, re
+path = sys.argv[1]
+with open(path, encoding="utf-8") as f:
+    text = f.read()
+# 删除从 "  # mihomo TUN 代理 sidecar" 注释到下一个顶层 service 之前的内容
+text = re.sub(r"\n  # mihomo TUN 代理 sidecar.*?(?=\n  # 可选：gateway 健康兜底|\nnetworks:|\nvolumes:)",
+              "\n", text, flags=re.S)
+with open(path, "w", encoding="utf-8") as f:
+    f.write(text)
+print("mihomo-tun service removed (--without-mihomo)")
 PYEOF
 fi
 
@@ -700,37 +719,89 @@ fi
 # ── 10.7 运维/自愈组件（可选）──
 if $WITH_MIHOMO || $WITH_WATCHDOG || $WITH_TASK_ENGINE; then
   step "10.7 安装运维/自愈组件"
-  mkdir -p /data/scripts /usr/local/bin /var/lib/openclaw
-  for s in selfcheck.py selfcheck-quick-cron.sh mihomo-guard.sh ensure-browser.sh ensure-telegram-alive.sh nightly-backup.sh pin-sbx-restart.sh entrypoint.sh; do
-    [ -f "$PROJECT_DIR/scripts/ops/$s" ] && cp "$PROJECT_DIR/scripts/ops/$s" /usr/local/bin/ && chmod +x "/usr/local/bin/$s" && ok "$s installed"
+  mkdir -p /data/scripts /usr/local/bin /var/lib/openclaw /data/opt
+
+  # 1) 全部通用运维脚本落到 /usr/local/bin
+  for s in "$PROJECT_DIR"/scripts/ops/*; do
+    [ -f "$s" ] || continue
+    b=$(basename "$s")
+    cp "$s" "/usr/local/bin/$b" && chmod +x "/usr/local/bin/$b" && ok "$b installed"
   done
-  [ -f "$PROJECT_DIR/templates/mihomo-config.yaml" ] && cp "$PROJECT_DIR/templates/mihomo-config.yaml" /data/etc/mihomo/config.yaml && ok "mihomo config installed"
+
+  # 2) 启动补丁 + 孤儿锁清理（挂载进 gateway 容器由 entrypoint 调用）
+  mkdir -p /data/opt/openclaw-patches
+  cp "$PROJECT_DIR"/openclaw-patches/*.sh /data/opt/openclaw-patches/ 2>/dev/null
+  chmod +x /data/opt/openclaw-patches/*.sh
+  ok "openclaw-patches 安装到 /data/opt/openclaw-patches"
+
+  # 3) docker CLI 包装（沙箱内需要 docker，但不直接暴露宿主 socket 权限）
+  mkdir -p /data/opt/docker-cli
+  HOST_DOCKER="$(command -v docker 2>/dev/null || echo /usr/bin/docker)"
+  if [ -x "$HOST_DOCKER" ]; then
+    cp "$HOST_DOCKER" /data/opt/docker-cli/docker.real
+    cat > /data/opt/docker-cli/docker <<'DOCKEREOF'
+#!/bin/sh
+# 沙箱内 docker CLI 包装：默认走宿主 docker.sock
+exec /usr/local/bin/docker.real "$@"
+DOCKEREOF
+    chmod +x /data/opt/docker-cli/docker /data/opt/docker-cli/docker.real
+    ok "docker-cli 包装安装到 /data/opt/docker-cli"
+  else
+    warn "未找到宿主 docker，跳过 docker-cli 包装"
+  fi
 fi
 
+# mihomo 配置（渲染到生产机真实路径 /usr/local/etc/mihomo/config.yaml）
 if $WITH_MIHOMO; then
+  mkdir -p /usr/local/etc/mihomo
+  if [ ! -f /usr/local/etc/mihomo/config.yaml ]; then
+    cp "$PROJECT_DIR/templates/mihomo-config.yaml" /usr/local/etc/mihomo/config.yaml
+    ok "mihomo 配置渲染到 /usr/local/etc/mihomo/config.yaml（请填入你的节点与 secret）"
+  else
+    info "mihomo 配置已存在，跳过渲染（如需重置请删除后重跑）"
+  fi
   # 生成 mihomo secret 若未设置
   if ! grep -qE '^MIHOMO_SECRET=' /data/etc/openclaw/runtime.env 2>/dev/null; then
     MSEC=$(openssl rand -hex 16 2>/dev/null || head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')
     echo "MIHOMO_SECRET=$MSEC" >> /data/etc/openclaw/runtime.env
   fi
-  # 替换 config.yaml 中的占位符
   MSEC=$(grep -E '^MIHOMO_SECRET=' /data/etc/openclaw/runtime.env | cut -d= -f2- || echo "")
-  [ -n "$MSEC" ] && sed -i "s/YOUR_MIHOMO_SECRET_HERE/$MSEC/g" /data/etc/mihomo/config.yaml
-  cat > /etc/cron.d/cakeclaw-mihomo-guard << 'CRONEOF'
-# mihomo 代理节点自动切换
-*/5 * * * * root /usr/local/bin/mihomo-guard.sh >> /data/logs/mihomo-guard.log 2>&1
-CRONEOF
-  chmod 644 /etc/cron.d/cakeclaw-mihomo-guard
-  ok "mihomo-guard cron 就位"
+  [ -n "$MSEC" ] && sed -i "s/YOUR_MIHOMO_SECRET_HERE/$MSEC/g" /usr/local/etc/mihomo/config.yaml
+  # 提示节点为占位符，需人工替换
+  if grep -qE '192\.0\.2\.1|YOUR_UUID_HERE' /usr/local/etc/mihomo/config.yaml 2>/dev/null; then
+    warn "mihomo 节点仍是模板占位符（192.0.2.1 / YOUR_UUID_HERE），启动前请替换为真实节点，否则无出口。"
+  fi
 fi
 
-if $WITH_WATCHDOG; then
-  cat > /etc/cron.d/cakeclaw-pin-sbx << 'CRONEOF'
-# 沙箱容器 restart policy 兜底
-*/2 * * * * root /usr/local/bin/pin-sbx-restart.sh >> /data/logs/pin-sbx-restart.log 2>&1
+# 统一 cron 矩阵（cron.d/openclaw-ops），仅在启用运维组件时写入
+if $WITH_MIHOMO || $WITH_WATCHDOG || $WITH_TASK_ENGINE; then
+  cat > /etc/cron.d/openclaw-ops << 'CRONEOF'
+# OpenClaw 运维矩阵 — 由安装脚本生成，重跑即覆盖
+# 沙箱重启策略钉死 unless-stopped
+*/2 * * * * root /usr/local/bin/pin-sbx-restart.sh
+# 沙箱全功能配置防漂移（binds + browser）
+*/5 * * * * root /usr/local/bin/openclaw-cfg-guard.py
+# Telegram 入站轮询保活，僵死则重启网关
+*/3 * * * * root /usr/local/bin/ensure-telegram-alive.sh
+# chromium 在位 + 浏览器在跑
+*/5 * * * * root /usr/local/bin/ensure-browser-alive.sh
+# 关键项快检（全绿静默，异常推 Telegram）
+*/10 * * * * root /usr/local/bin/selfcheck-quick-cron.sh
+# mihomo 模型 API 出口守护 + 自动切节点
+*/2 * * * * root /usr/local/bin/mihomo-guard.sh
+# gateway resolv.conf 防回滚到被污染 DNS
+*/5 * * * * root /usr/local/bin/fix-gateway-dns.sh
+# skills CLI 自愈
+*/30 * * * * root /usr/local/bin/ensure-skill-bins.sh
+# 全量备份，保留 7 天
+17 4 * * * root /usr/local/bin/nightly-backup.sh
+# 环境快照
+30 4 * * * root /usr/local/bin/gen-env-snapshot.sh
+# 任务停滞看门狗（24h+ 去重告警）
+17 */6 * * * root cd /data/state/workspace/task-engine && ./stale_alert.sh
 CRONEOF
-  chmod 644 /etc/cron.d/cakeclaw-pin-sbx
-  ok "pin-sbx-restart cron 就位"
+  chmod 644 /etc/cron.d/openclaw-ops
+  ok "运维 cron 矩阵就位（/etc/cron.d/openclaw-ops）"
 fi
 
 if $WITH_TASK_ENGINE; then
@@ -738,12 +809,7 @@ if $WITH_TASK_ENGINE; then
   chown -R 1000:1000 /data/state/workspace/task-engine
   cp -r "$PROJECT_DIR/task-engine"/* /data/state/workspace/task-engine/
   chmod +x /data/state/workspace/task-engine/*.py /data/state/workspace/task-engine/*.sh 2>/dev/null || true
-  cat > /etc/cron.d/cakeclaw-stale-alert << 'CRONEOF'
-# 任务停滞告警（带去重）
-17 */6 * * * root cd /data/state/workspace/task-engine && ./stale_alert.sh >> /data/logs/stale-alert.log 2>&1
-CRONEOF
-  chmod 644 /etc/cron.d/cakeclaw-stale-alert
-  ok "task-engine 组件就位"
+  ok "task-engine 组件就位（/data/state/workspace/task-engine）"
 fi
 
 # ── 11. 凭证摘要 ──
