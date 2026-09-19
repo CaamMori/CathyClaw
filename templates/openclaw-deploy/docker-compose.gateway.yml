@@ -1,0 +1,75 @@
+# OpenClaw Gateway Docker Compose - production template
+# MUST CHANGE: runtime.env, mihomo proxy, YOUR_DOCKER_GROUP_ID
+# OPTIONAL: image versions, resource limits
+
+services:
+  gateway:
+    image: ghcr.io/openclaw/openclaw:YOUR_OPENCLAW_VERSION_HERE
+    container_name: openclaw-gateway
+    restart: unless-stopped
+    network_mode: host
+    # OpenClaw 镜像以 node(uid=1000) 运行；与 workspace 属主一致可避免沙箱写失败。
+    # 同时通过 group_add 加入 docker 组，获得 docker.sock 访问权限。
+    user: "1000:1000"
+    group_add:
+      - "YOUR_DOCKER_GROUP_ID"  # find: stat -c '%g' /var/run/docker.sock
+    extra_hosts:
+      # DNS self-loop prevention: static IPs for domains that break in TUN mode
+      # Find real IPs: dig +short <domain> from a machine WITHOUT mihomo TUN
+      - "api.telegram.org:149.154.166.110"
+      # NOTE: this IP may drift over time; refresh with: dig +short api.telegram.org (from a host WITHOUT TUN)
+      # - "your-api-endpoint:YOUR_API_IP"
+    volumes:
+      - /data/state:/home/node/.openclaw
+      - /data/state/workspace:/home/node/.openclaw/workspace
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /data/scripts/entrypoint.sh:/usr/local/bin/openclaw-entrypoint.sh:ro
+      - /data/etc/openclaw/telegram-bot-token:/data/etc/openclaw/telegram-bot-token:ro
+    env_file:
+      - /data/etc/openclaw/runtime.env
+    entrypoint: ["/usr/local/bin/openclaw-entrypoint.sh"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS --max-time 5 http://127.0.0.1:18789/ >/dev/null || openclaw health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+
+  mihomo-tun:
+    image: metacubex/mihomo:YOUR_MIHOMO_VERSION_HERE
+    container_name: mihomo-tun
+    restart: unless-stopped
+    network_mode: service:gateway
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    volumes:
+      - /data/etc/mihomo:/root/.config/mihomo
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- --timeout=5 http://127.0.0.1:9090/ || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  recovery-watchdog:
+    image: docker:cli
+    container_name: openclaw-recovery-watchdog
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /var/log/watchdog:/var/log
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        while true; do
+          S=$(docker inspect -f '{{.State.Health.Status}}' openclaw-gateway 2>/dev/null)
+          if [ "$$S" != "healthy" ]; then
+            echo "[$(date)] Gateway unhealthy ($$S), restarting" >> /var/log/watchdog.log
+            docker restart openclaw-gateway
+          fi
+          sleep 15
+        done

@@ -5,15 +5,25 @@ services:
     restart: unless-stopped
     ports:
       - "127.0.0.1:${GATEWAY_PORT}:18789"
+    # OpenClaw 镜像以 node(uid=1000) 运行，与 workspace 属主一致避免沙箱写失败。
+    # docker.sock 挂载用于管理沙箱容器；如不需要沙箱功能可移除。
+    user: "1000:1000"
+    group_add:
+      - "${DOCKER_GROUP_ID:-999}"
     volumes:
-      - /data/workspace:/data/workspace
+      - /data/state/workspace:/home/node/.openclaw/workspace
       - /data/state:/home/node/.openclaw
-      # Telegram Token 使用专用目录，避免把 runtime.env 暴露给容器。
-      - /data/etc/openclaw/telegram:/data/etc/openclaw/telegram:ro
+      # Telegram bot token 使用独立文件，不进入 runtime.env
+      - /data/etc/openclaw/telegram/bot-token:/data/etc/openclaw/telegram/bot-token:ro
+      # 启动前清理遗留锁文件
+      - /data/scripts/entrypoint.sh:/usr/local/bin/openclaw-entrypoint.sh:ro
+      # 可选：管理沙箱容器；不需要沙箱时注释掉
+      - /var/run/docker.sock:/var/run/docker.sock
     env_file:
       - /data/etc/openclaw/runtime.env
     environment:
       - HOME=/home/node
+    entrypoint: ["/usr/local/bin/openclaw-entrypoint.sh"]
     mem_limit: ${GATEWAY_MEM_LIMIT}
     cpus: "${GATEWAY_CPU_LIMIT}"
     pids_limit: ${GATEWAY_PID_LIMIT}
@@ -26,7 +36,8 @@ services:
           cpus: "${GATEWAY_CPU_LIMIT}"
           pids: ${GATEWAY_PID_LIMIT}
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS --max-time 5 http://127.0.0.1:18789/ >/dev/null || exit 1"]
+      # 优先 curl 探测 HTTP 端口，失败时回退 openclaw CLI
+      test: ["CMD-SHELL", "curl -fsS --max-time 5 http://127.0.0.1:18789/ >/dev/null || openclaw health || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 5
@@ -36,3 +47,49 @@ services:
       options:
         max-size: "50m"
         max-file: "3"
+
+  # 可选：mihomo TUN 代理 sidecar
+  # 用法：docker compose --profile mihomo up -d
+  # mihomo 与 gateway 共享 netns，TUN 接管 gateway 容器内全部出站流量。
+  mihomo-tun:
+    profiles: ["mihomo"]
+    image: ${MIHOMO_IMAGE:-metacubex/mihomo:latest}
+    container_name: mihomo-tun
+    restart: unless-stopped
+    network_mode: service:cakeclaw-gateway
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    volumes:
+      - /data/etc/mihomo:/root/.config/mihomo
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- --timeout=5 http://127.0.0.1:9090/ || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # 可选：gateway 健康兜底 watchdog
+  # 用法：docker compose --profile watchdog up -d
+  recovery-watchdog:
+    profiles: ["watchdog"]
+    image: docker:cli
+    container_name: cakeclaw-recovery-watchdog
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /var/log/watchdog:/var/log
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        while true; do
+          S=$(docker inspect -f '{{.State.Health.Status}}' cakeclaw-gateway 2>/dev/null)
+          if [ "$$S" != "healthy" ]; then
+            echo "[$$(date)] Gateway unhealthy ($$S), restarting" >> /var/log/watchdog.log
+            docker restart cakeclaw-gateway
+          fi
+          sleep 15
+        done

@@ -129,14 +129,22 @@ CODEX_FIX_B=false
 OPENCODE_INSTALL=false
 HELP=false
 NEED_RESTART=false
+WITH_MIHOMO=false
+WITH_TASK_ENGINE=false
+WITH_WATCHDOG=false
+WITH_SANDBOX=false
 for arg in "$@"; do
   case "$arg" in
     --no-phase2) PHASE2=false ;;
     --no-phase3) PHASE3=false ;;
     --with-codex-fix) CODEX_FIX=true ;;
     --with-codex-fix-b) CODEX_FIX_B=true ;;
+    --with-mihomo) WITH_MIHOMO=true ;;
+    --with-task-engine) WITH_TASK_ENGINE=true ;;
+    --with-watchdog) WITH_WATCHDOG=true ;;
+    --with-sandbox) WITH_SANDBOX=true ;;
     --help|-h)   HELP=true ;;
-    *) fail "未知参数: $arg。支持的参数: --no-phase2 --no-phase3 --with-codex-fix --with-codex-fix-b --help" ;;
+    *) fail "未知参数: $arg。支持的参数: --no-phase2 --no-phase3 --with-codex-fix --with-codex-fix-b --with-mihomo --with-task-engine --with-watchdog --with-sandbox --help" ;;
   esac
 done
 if $HELP; then
@@ -145,6 +153,10 @@ if $HELP; then
   echo "  --no-phase3         跳过审计"
   echo "  --with-codex-fix    启用 Codex 修复（方案 A）"
   echo "  --with-codex-fix-b  启用 Codex 修复（方案 B）"
+  echo "  --with-mihomo       启用 mihomo TUN 代理 sidecar"
+  echo "  --with-task-engine  启用任务引擎（taskctl + taskboard + stale guard）"
+  echo "  --with-watchdog     启用 recovery-watchdog 容器"
+  echo "  --with-sandbox      启用 docker.sock 挂载（用于 OpenClaw 沙箱）"
   echo "  --help              显示此帮助"
   exit 0
 fi
@@ -174,6 +186,13 @@ fi
 
 # 默认值
 DOMAIN="${DOMAIN:-}"
+GATEWAY_IMAGE="${GATEWAY_IMAGE:-ghcr.io/openclaw/openclaw:2026.7.1}"
+MIHOMO_IMAGE="${MIHOMO_IMAGE:-metacubex/mihomo:latest}"
+DOCKER_GROUP_ID="${DOCKER_GROUP_ID:-999}"
+[ "${MIHOMO_ENABLE:-}" = "1" ] && WITH_MIHOMO=true
+[ "${TASK_ENGINE_ENABLE:-}" = "1" ] && WITH_TASK_ENGINE=true
+[ "${WATCHDOG_ENABLE:-}" = "1" ] && WITH_WATCHDOG=true
+[ "${SANDBOX_ENABLE:-}" = "1" ] && WITH_SANDBOX=true
 # 交互安装时让用户直接提供域名；该值同时用于 Nginx、Let's Encrypt 与 Control UI 来源白名单。
 # 非交互环境继续只从 .env / DOMAIN 环境变量读取，避免 CI 卡在输入提示。
 if $INTERACTIVE && [ -z "$DOMAIN" ]; then
@@ -361,14 +380,17 @@ fi
 
 # ── 3. 目录结构 ──
 step "3. 创建目录"
-for d in /data/state /data/workspace /data/backups/openclaw-state /data/logs /data/scripts /data/etc/openclaw; do
+# 统一 workspace 路径为 /data/state/workspace，同时保留 /data/workspace 软链兼容旧脚本
+mkdir -p /data/state/workspace
+[ -e /data/workspace ] || ln -sfn /data/state/workspace /data/workspace
+for d in /data/backups/openclaw-state /data/backups/nightly /data/logs /data/scripts /data/etc/openclaw /data/etc/mihomo /data/var/lib/openclaw; do
   mkdir -p "$d"
 done
 for d in /data/knowledge/{runbooks,playbooks,templates,changelog,architecture}; do
   mkdir -p "$d"
 done
-chmod 700 /data/backups /data/state /data/etc/openclaw
-chmod 755 /data/workspace /data/logs /data/scripts /data/knowledge
+chmod 700 /data/backups /data/state /data/etc/openclaw /data/var/lib/openclaw
+chmod 755 /data/state/workspace /data/logs /data/scripts /data/knowledge
 # Gateway 以 UID/GID 1000（node）运行；Telegram Token 专用目录只对该用户开放，
 # Compose 仅挂载该目录，不暴露同级的 runtime.env。
 install -d -o 1000 -g 1000 -m 700 "${TELEGRAM_TOKEN_DIR}"
@@ -437,9 +459,9 @@ step "6. 部署 Gateway"
 docker pull "${GATEWAY_IMAGE}" 2>&1 | tail -3
 
 # 生成 docker-compose.yml（持久化，避免 /tmp 被清）
-export GATEWAY_PORT GATEWAY_IMAGE GATEWAY_MEM_LIMIT GATEWAY_CPU_LIMIT GATEWAY_PID_LIMIT
+export GATEWAY_PORT GATEWAY_IMAGE GATEWAY_MEM_LIMIT GATEWAY_CPU_LIMIT GATEWAY_PID_LIMIT MIHOMO_IMAGE DOCKER_GROUP_ID
 COMPOSE_FILE="/data/etc/openclaw/docker-compose.yml"
-envsubst '$GATEWAY_PORT $GATEWAY_IMAGE $GATEWAY_MEM_LIMIT $GATEWAY_CPU_LIMIT $GATEWAY_PID_LIMIT' \
+envsubst '$GATEWAY_PORT $GATEWAY_IMAGE $GATEWAY_MEM_LIMIT $GATEWAY_CPU_LIMIT $GATEWAY_PID_LIMIT $MIHOMO_IMAGE $DOCKER_GROUP_ID' \
   < "$PROJECT_DIR/docker-compose.yml" > "${COMPOSE_FILE}"
 # 防御：确认模板里的所有 ${VAR} 都已被替换，没有残留占位符。
 # 若未来有人在 docker-compose.yml 新增变量却忘了同步 envsubst 列表，
@@ -448,6 +470,34 @@ if grep -qE '\$\{[A-Za-z_][A-Za-z0-9_]*\}' "${COMPOSE_FILE}"; then
   fail "docker-compose 生成失败：存在未替换的占位符，请同步 envsubst 变量列表。残留: $(grep -oE '\$\{[A-Za-z_][A-Za-z0-9_]*\}' "${COMPOSE_FILE}" | sort -u | tr '\n' ' ')"
 fi
 chmod 600 "${COMPOSE_FILE}"
+
+# 若未启用沙箱，移除 docker.sock 挂载以降低攻击面
+if ! $WITH_SANDBOX; then
+  python3 - "${COMPOSE_FILE}" << 'PYEOF'
+import sys
+path = sys.argv[1]
+with open(path, encoding="utf-8") as f:
+    lines = f.readlines()
+filtered = []
+in_gateway_volumes = False
+for line in lines:
+    stripped = line.strip()
+    if stripped == "volumes:" and line.startswith("    "):
+        # 粗略定位 gateway 服务的 volumes 段（4空格缩进）
+        in_gateway_volumes = True
+        filtered.append(line)
+        continue
+    if in_gateway_volumes:
+        if stripped.startswith("-") and "docker.sock" in line:
+            continue
+        if stripped == "" or (not line.startswith("      ") and not line.startswith("    volumes:")):
+            in_gateway_volumes = False
+    filtered.append(line)
+with open(path, "w", encoding="utf-8") as f:
+    f.writelines(filtered)
+print("docker.sock mount removed (--without-sandbox)")
+PYEOF
+fi
 
 # 保留重跑前已验证生效的 Codex 补丁挂载。模板本身不含该可选挂载，若不恢复会导致
 # 重跑安装时先丢失补丁、随后重复弹出交互配置。
@@ -540,7 +590,10 @@ else
   info "未启用 Codex 修复（--with-codex-fix / --with-codex-fix-b 未指定）"
 fi
 
-docker compose -f "${COMPOSE_FILE}" up -d 2>&1 || fail "Gateway 启动失败"
+COMPOSE_PROFILES=""
+$WITH_MIHOMO && COMPOSE_PROFILES="${COMPOSE_PROFILES} --profile mihomo"
+$WITH_WATCHDOG && COMPOSE_PROFILES="${COMPOSE_PROFILES} --profile watchdog"
+docker compose -f "${COMPOSE_FILE}" ${COMPOSE_PROFILES} up -d 2>&1 || fail "Gateway 启动失败"
 
 # 若无后续配置改动（未启用 Codex 补丁），在此等待 Gateway healthy；
 # 若已启用 Codex 补丁（NEED_RESTART=true），则只拉起容器、跳过等待，由 12.8 统一重启并确认 healthy。
@@ -809,6 +862,55 @@ CRONEOF
   ok "audit + changelog cron 就位（cron.d）"
 else
   info "跳过 Phase 3 (--no-phase3)"
+fi
+
+# ── 10.7 openclaw-deploy 运维组件（可选）──
+if $WITH_MIHOMO || $WITH_WATCHDOG || $WITH_TASK_ENGINE; then
+  step "10.7 安装 openclaw-deploy 运维组件"
+  mkdir -p /data/scripts /usr/local/bin /var/lib/openclaw
+  for s in selfcheck.py selfcheck-quick-cron.sh mihomo-guard.sh ensure-browser.sh ensure-telegram-alive.sh nightly-backup.sh pin-sbx-restart.sh entrypoint.sh; do
+    [ -f "$PROJECT_DIR/scripts/openclaw-deploy/$s" ] && cp "$PROJECT_DIR/scripts/openclaw-deploy/$s" /usr/local/bin/ && chmod +x "/usr/local/bin/$s" && ok "$s installed"
+  done
+  [ -f "$PROJECT_DIR/templates/openclaw-deploy/mihomo-config.yaml" ] && cp "$PROJECT_DIR/templates/openclaw-deploy/mihomo-config.yaml" /data/etc/mihomo/config.yaml && ok "mihomo config installed"
+fi
+
+if $WITH_MIHOMO; then
+  # 生成 mihomo secret 若未设置
+  if ! grep -qE '^MIHOMO_SECRET=' /data/etc/openclaw/runtime.env 2>/dev/null; then
+    MSEC=$(openssl rand -hex 16 2>/dev/null || head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')
+    echo "MIHOMO_SECRET=$MSEC" >> /data/etc/openclaw/runtime.env
+  fi
+  # 替换 config.yaml 中的占位符
+  MSEC=$(grep -E '^MIHOMO_SECRET=' /data/etc/openclaw/runtime.env | cut -d= -f2- || echo "")
+  [ -n "$MSEC" ] && sed -i "s/YOUR_MIHOMO_SECRET_HERE/$MSEC/g" /data/etc/mihomo/config.yaml
+  cat > /etc/cron.d/cakeclaw-mihomo-guard << 'CRONEOF'
+# mihomo 代理节点自动切换
+*/5 * * * * root /usr/local/bin/mihomo-guard.sh >> /data/logs/mihomo-guard.log 2>&1
+CRONEOF
+  chmod 644 /etc/cron.d/cakeclaw-mihomo-guard
+  ok "mihomo-guard cron 就位"
+fi
+
+if $WITH_WATCHDOG; then
+  cat > /etc/cron.d/cakeclaw-pin-sbx << 'CRONEOF'
+# 沙箱容器 restart policy 兜底
+*/2 * * * * root /usr/local/bin/pin-sbx-restart.sh >> /data/logs/pin-sbx-restart.log 2>&1
+CRONEOF
+  chmod 644 /etc/cron.d/cakeclaw-pin-sbx
+  ok "pin-sbx-restart cron 就位"
+fi
+
+if $WITH_TASK_ENGINE; then
+  mkdir -p /data/state/workspace/task-engine
+  chown -R 1000:1000 /data/state/workspace/task-engine
+  cp -r "$PROJECT_DIR/task-engine"/* /data/state/workspace/task-engine/
+  chmod +x /data/state/workspace/task-engine/*.py /data/state/workspace/task-engine/*.sh 2>/dev/null || true
+  cat > /etc/cron.d/cakeclaw-stale-alert << 'CRONEOF'
+# 任务停滞告警（带去重）
+17 */6 * * * root cd /data/state/workspace/task-engine && ./stale_alert.sh >> /data/logs/stale-alert.log 2>&1
+CRONEOF
+  chmod 644 /etc/cron.d/cakeclaw-stale-alert
+  ok "task-engine 组件就位"
 fi
 
 # ── 11. 凭证摘要 ──
@@ -1446,7 +1548,10 @@ fi
 if $NEED_RESTART; then
   step "12.8 重启 Gateway 生效"
   info "检测到配置/补丁改动，重启 Gateway 使其生效..."
-  docker compose -f /data/etc/openclaw/docker-compose.yml up -d 2>&1 || fail "Gateway 重启失败"
+  COMPOSE_PROFILES=""
+  $WITH_MIHOMO && COMPOSE_PROFILES="${COMPOSE_PROFILES} --profile mihomo"
+  $WITH_WATCHDOG && COMPOSE_PROFILES="${COMPOSE_PROFILES} --profile watchdog"
+  docker compose -f /data/etc/openclaw/docker-compose.yml ${COMPOSE_PROFILES} up -d 2>&1 || fail "Gateway 重启失败"
   wait_gateway_ready
 fi
 

@@ -1,0 +1,56 @@
+# mihomo TUN proxy - production skeleton
+# MUST CHANGE: proxy nodes, domain rules for your API providers
+# WARNING: API domains MUST have rules BEFORE GEOIP/CN (see gotchas.md #4)
+
+mixed-port: 7890
+allow-lan: false
+mode: rule
+log-level: info
+external-controller: 127.0.0.1:9090
+# MUST CHANGE: 设置一个强密码，避免任何人能访问 9090 的人控制 mihomo
+# 在 gateway netns 内虽不可从外部直达，但仍属于安全基线。
+secret: "YOUR_MIHOMO_SECRET_HERE"
+
+tun:
+  enable: true
+  stack: system
+  auto-route: true
+  auto-detect-interface: true
+
+dns:
+  enable: true
+  listen: 0.0.0.0:53
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  respect-rules: true
+  default-nameserver:
+    - 1.1.1.1
+  nameserver:
+    - https://1.1.1.1/dns-query
+  fake-ip-filter:
+    - "+.localhost"
+    - "+.local"
+
+proxies:
+  # MUST CHANGE: 192.0.2.1 是 TEST-NET-1 保留地址，无法真实连接。
+  # 替换为你的真实代理节点，或从订阅转换得到完整配置。
+  - name: "PROXY_NODE_1"
+    type: vless
+    server: YOUR_PROXY_SERVER_HERE
+    port: 443
+    uuid: YOUR_UUID_HERE
+    tls: true
+
+proxy-groups:
+  - name: "main-proxy"
+    type: select
+    proxies:
+      - "PROXY_NODE_1"
+      - "DIRECT"
+
+rules:
+  - DOMAIN-SUFFIX,api.telegram.org,main-proxy
+  - DOMAIN-SUFFIX,t.me,main-proxy
+  - DOMAIN-SUFFIX,openai.com,main-proxy
+  - GEOIP,CN,DIRECT
+  - MATCH,main-proxy

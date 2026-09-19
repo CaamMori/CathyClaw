@@ -1,7 +1,43 @@
 {
+  "meta": { "lastTouchedVersion": "2026.9.4" },
   "gateway": {
     "mode": "local",
     "port": 18789,
-    "bind": "lan"
+    "bind": "127.0.0.1",
+    "auth": { "token": "${OPENCLAW_GATEWAY_TOKEN}" }
+  },
+  "channels": {
+    "telegram": {
+      "enabled": true,
+      "tokenFile": "/data/etc/openclaw/telegram/bot-token",
+      "allowFrom": ["tg:${TELEGRAM_OWNER_ID}"],
+      "streaming": "partial"
+    }
+  },
+  "commands": {
+    "ownerAllowFrom": ["telegram:${TELEGRAM_OWNER_ID}"]
+  },
+  "agents": {
+    "entries": {
+      "main": {
+        "name": "Main",
+        "identity": { "emoji": "🌙" },
+        "tools": {
+          "elevated": {
+            "allowFrom": { "telegram": ["tg:${TELEGRAM_OWNER_ID}"] }
+          }
+        }
+      }
+    },
+    "defaults": {
+      "model": { "primary": "${PRIMARY_MODEL}" },
+      "fallbacks": [],
+      "compaction": { "mode": "safeguard", "timeoutSeconds": 120 },
+      "streaming": { "mode": "partial" },
+      "timeoutSeconds": 40
+    }
+  },
+  "models": {
+    "providers": {}
   }
 }
