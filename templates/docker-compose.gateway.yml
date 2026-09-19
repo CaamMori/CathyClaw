@@ -4,7 +4,7 @@
 #   1) 把 openclaw-patches/ 渲染到 /data/opt/openclaw-patches/（启动补丁 + 孤儿锁清理）
 #   2) 把 docker-cli 包装渲染到 /data/opt/docker-cli/
 #   3) 把 mihomo 模板渲染到 /usr/local/etc/mihomo/config.yaml
-# 修改下面的 YOUR_* 占位符后，docker compose up -d 即可。
+# 本文件由 scripts/install.sh 渲染生成；占位符以 ${...} 语义替换，请勿手改。
 
 services:
   openclaw-gateway:
@@ -28,9 +28,9 @@ services:
     env_file:
       - /data/etc/openclaw/runtime.env
     extra_hosts:
-      # Telegram API 在 TUN 模式下 DNS 会污染，静态指向真实 IP 防回环；
-      # 该 IP 可能漂移，无 TUN 时从宿主机 dig +short api.telegram.org 重新取。
-      - "api.telegram.org:149.154.166.110"
+      # Telegram API 在 TUN 模式下 DNS 会污染，静态指向真实 IP 防回环。
+      # 仅在启用 mihomo（境内机）时需要；海外机直连不需钉 IP，该行会被移除。
+      - "api.telegram.org:YOUR_TELEGRAM_API_IP"
     # docker.sock 组权限由 group_add 解决（不要用 root）。
     # 取值：stat -c '%g' /var/run/docker.sock
     group_add:
@@ -41,9 +41,9 @@ services:
     deploy:
       resources:
         limits:
-          memory: 2.8g
-          cpus: "3.5"
-          pids: -1
+          memory: YOUR_GATEWAY_MEM_LIMIT
+          cpus: "YOUR_GATEWAY_CPU_LIMIT"
+          pids: YOUR_GATEWAY_PID_LIMIT
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS --max-time 5 http://127.0.0.1:18789/ >/dev/null || node dist/docker-healthcheck.js"]
       interval: 30s
@@ -81,7 +81,7 @@ networks:
   default:
     ipam:
       config:
-        - subnet: 192.168.16.0/24
+        - subnet: YOUR_COMPOSE_SUBNET
 
 volumes:
   mihomo-data:

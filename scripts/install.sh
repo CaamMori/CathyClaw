@@ -412,13 +412,39 @@ COMPOSE_FILE="/data/etc/openclaw/docker-compose.yml"
 # 直接用完整镜像名替换（用户可能用任意镜像站，如 ghcr.nju.edu.cn/openclaw/openclaw:tag），
 # 不能只取 tag 拼接——那会把仓库名带进去，拼出 .../openclaw:openclaw:tag 这种非法引用。
 if [ -z "${DOCKER_GROUP_ID:-}" ]; then DOCKER_GROUP_ID="$(stat -c '%g' /var/run/docker.sock 2>/dev/null || echo 999)"; fi
+# Telegram API 死 IP：仅境内机（TUN 模式）需要钉住防 DNS 污染；海外机直连不需要。
+TELEGRAM_API_IP=""
+if $WITH_MIHOMO; then
+  TELEGRAM_API_IP="$(getent hosts api.telegram.org 2>/dev/null | awk '{print $1; exit}')"
+  [ -z "$TELEGRAM_API_IP" ] && TELEGRAM_API_IP="149.154.166.110"
+fi
+# Compose 子网：避开常见冲突段，取一段私有地址。
+COMPOSE_SUBNET="${COMPOSE_SUBNET:-192.168.16.0/24}"
 sed -e "s|YOUR_GATEWAY_IMAGE|${GATEWAY_IMAGE}|g" \
     -e "s|YOUR_MIHOMO_IMAGE|${MIHOMO_IMAGE}|g" \
     -e "s|YOUR_DOCKER_GROUP_ID|${DOCKER_GROUP_ID}|g" \
+    -e "s|YOUR_GATEWAY_MEM_LIMIT|${GATEWAY_MEM_LIMIT}|g" \
+    -e "s|YOUR_GATEWAY_CPU_LIMIT|${GATEWAY_CPU_LIMIT}|g" \
+    -e "s|YOUR_GATEWAY_PID_LIMIT|${GATEWAY_PID_LIMIT}|g" \
+    -e "s|YOUR_COMPOSE_SUBNET|${COMPOSE_SUBNET}|g" \
     "$PROJECT_DIR/docker-compose.yml" > "${COMPOSE_FILE}"
+# telegram 死 IP 与 extra_hosts：海外机整段移除（直连即可，钉 IP 反而易失效）
+if [ -z "$TELEGRAM_API_IP" ]; then
+  python3 - "${COMPOSE_FILE}" << 'PYEOF_TG'
+import sys, re
+path = sys.argv[1]
+text = open(path, encoding="utf-8").read()
+text = re.sub(r"\n    extra_hosts:\n(?:      #.*\n|      - \"[^\"]*\"\n)+", "\n", text)
+open(path, "w", encoding="utf-8").write(text)
+print("extra_hosts removed (direct egress, no TUN)")
+PYEOF_TG
+else
+  sed -i "s|YOUR_TELEGRAM_API_IP|${TELEGRAM_API_IP}|g" "${COMPOSE_FILE}"
+fi
 # 防御：确认模板里的所有 YOUR_* 占位符都已被替换，没有残留。
-if grep -qE 'YOUR_[A-Z_]+' "${COMPOSE_FILE}"; then
-  fail "docker-compose 生成失败：存在未替换的占位符。残留: $(grep -oE 'YOUR_[A-Z_]+' "${COMPOSE_FILE}" | sort -u | tr '\n' ' ')"
+# 只检查非注释行：注释里可能提到占位符写法，不应视为渲染失败。
+if grep -vE '^\s*#' "${COMPOSE_FILE}" | grep -qE 'YOUR_[A-Z_]+'; then
+  fail "docker-compose 生成失败：存在未替换的占位符。残留: $(grep -vE '^\s*#' "${COMPOSE_FILE}" | grep -oE 'YOUR_[A-Z_]+' | sort -u | tr '\n' ' ')"
 fi
 chmod 600 "${COMPOSE_FILE}"
 
