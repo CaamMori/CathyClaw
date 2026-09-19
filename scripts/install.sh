@@ -13,6 +13,11 @@ fail() { echo -e "${RED}[FAIL]${NC} $*"; exit 1; }
 ok()   { echo -e "${GREEN}[OK]${NC} $*"; }
 info() { echo -e "${YELLOW}[INFO]${NC} $*"; }
 step() { echo ""; echo -e "${GREEN}── ${1} ──${NC}"; }
+# warn 此前只被调用、从未定义（16 处调用点全部失效）。因为多数调用位于
+# `cmd || warn ...` 这类分支里，set -e 不会中断，脚本照常继续，
+# 只在终端留下一行 "warn: command not found"——极易被当成噪声忽略。
+# 结果是所有降级/自愈路径都失去了可见性（含挂载类型自愈、沙箱构建失败等）。
+warn() { echo -e "${YELLOW}[WARN]${NC} $*" >&2; }
 
 # 交互输入优先使用 stdin；若 stdin 被管道/重定向占用但当前仍有控制终端，
 # 则从 /dev/tty 读取。这样 `curl ... | bash`、`... | tee` 等启动方式仍可提问；
