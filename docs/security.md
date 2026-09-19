@@ -1,4 +1,4 @@
-# CakeClaw 安全模型
+# OpenClaw-CakeClaw 安全模型
 
 ## 双层设计
 

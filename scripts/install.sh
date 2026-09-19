@@ -864,14 +864,14 @@ else
   info "跳过 Phase 3 (--no-phase3)"
 fi
 
-# ── 10.7 openclaw-deploy 运维组件（可选）──
+# ── 10.7 运维/自愈组件（可选）──
 if $WITH_MIHOMO || $WITH_WATCHDOG || $WITH_TASK_ENGINE; then
-  step "10.7 安装 openclaw-deploy 运维组件"
+  step "10.7 安装运维/自愈组件"
   mkdir -p /data/scripts /usr/local/bin /var/lib/openclaw
   for s in selfcheck.py selfcheck-quick-cron.sh mihomo-guard.sh ensure-browser.sh ensure-telegram-alive.sh nightly-backup.sh pin-sbx-restart.sh entrypoint.sh; do
-    [ -f "$PROJECT_DIR/scripts/openclaw-deploy/$s" ] && cp "$PROJECT_DIR/scripts/openclaw-deploy/$s" /usr/local/bin/ && chmod +x "/usr/local/bin/$s" && ok "$s installed"
+    [ -f "$PROJECT_DIR/scripts/ops/$s" ] && cp "$PROJECT_DIR/scripts/ops/$s" /usr/local/bin/ && chmod +x "/usr/local/bin/$s" && ok "$s installed"
   done
-  [ -f "$PROJECT_DIR/templates/openclaw-deploy/mihomo-config.yaml" ] && cp "$PROJECT_DIR/templates/openclaw-deploy/mihomo-config.yaml" /data/etc/mihomo/config.yaml && ok "mihomo config installed"
+  [ -f "$PROJECT_DIR/templates/mihomo-config.yaml" ] && cp "$PROJECT_DIR/templates/mihomo-config.yaml" /data/etc/mihomo/config.yaml && ok "mihomo config installed"
 fi
 
 if $WITH_MIHOMO; then

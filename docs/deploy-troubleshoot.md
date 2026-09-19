@@ -3,8 +3,8 @@
 ## 部署
 
 ```bash
-git clone https://github.com/CaamMori/CakeClaw.git cakeclaw
-cd cakeclaw
+git clone https://github.com/CaamMori/OpenClaw-CakeClaw.git openclaw-cakeclaw
+cd openclaw-cakeclaw
 sudo ./scripts/install.sh
 ```
 

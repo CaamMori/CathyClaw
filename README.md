@@ -1,18 +1,28 @@
 # OpenClaw-CakeClaw
 
-基于 [CakeClaw](https://github.com/CaamMori/CakeClaw) 与 [openclaw-deploy](https://github.com/CaamMori/openclaw-deploy) 整合的 OpenClaw 生产部署方案。
+OpenClaw 生产部署套件：一键完成系统加固、HTTPS 入口、容器编排、出海代理、任务引擎与自愈运维。
 
-保留 CakeClaw 的"一键系统初始化 + Web 入口"能力，同时引入 openclaw-deploy 的 **mihomo TUN 代理**、**任务引擎**、**自愈运维脚本** 与 **多 Agent 配置经验**。
+## 能力一览
+
+| 模块 | 说明 |
+|---|---|
+| **系统初始化** | Swap、UFW、Docker、Nginx、Certbot、logrotate、cron |
+| **Web 入口** | 域名 + HTTPS，或纯 IP + 8080 |
+| **Gateway** | OpenClaw 核心服务，桥接网络，资源受限 |
+| **mihomo TUN** | 可选 sidecar，为 gateway 提供出海代理（`--with-mihomo`） |
+| **任务引擎** |  durable task 调度、心跳、僵死检测、Telegram 通知（`--with-task-engine`） |
+| **自愈运维** | mihomo 节点探活、浏览器/telegram 保活、配置备份（`--with-watchdog`） |
+| **沙箱** | Docker 沙箱生命周期管理（`--with-sandbox`） |
 
 ## 快速开始
 
 ```bash
 git clone https://github.com/CaamMori/OpenClaw-CakeClaw.git
 cd OpenClaw-CakeClaw
-sudo ./scripts/install.sh --with-mihomo --with-task-engine --with-watchdog --with-sandbox
+sudo ./scripts/install.sh --with-mihomo --with-task-engine --with-watchdog
 ```
 
-无域名也能跑，默认通过 `http://<IP>:8080` 访问控制台。
+无域名时默认通过 `http://<IP>:8080` 访问控制台。
 
 ## 可选功能
 
@@ -32,13 +42,26 @@ sudo ./scripts/install.sh --with-mihomo --with-task-engine --with-watchdog --wit
 sudo ./scripts/install.sh --help
 ```
 
+## 目录说明
+
+```
+.
+├── docker-compose.yml      # 主编排文件（含可选 profiles）
+├── scripts/
+│   ├── install.sh          # 一键安装
+│   ├── ops/                # 运维/自愈脚本
+│   └── ...
+├── task-engine/            # 任务调度与心跳守护
+├── templates/              # 配置模板
+└── docs/                   # 部署、运维、安全文档
+```
+
 ## 文档
 
-- [整合说明](docs/integration.md)
+- [部署指南](docs/deployment.md)
+- [运维手册](docs/ops.md)
 - [安全模型](docs/security.md)
-- [部署与排错](docs/deploy-troubleshoot.md)
-- [踩坑记录](docs/openclaw-deploy/gotchas.md)
-- [运维手册](docs/openclaw-deploy/operations.md)
+- [部署排错](docs/deploy-troubleshoot.md)
 - [Phase 4 多节点设计](docs/phase4-plan.md)
 
 ## License
