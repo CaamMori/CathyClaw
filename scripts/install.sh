@@ -635,34 +635,34 @@ PYEOF_TGDIS
 COMPOSE_PROFILES=""
 $WITH_MIHOMO && COMPOSE_PROFILES="${COMPOSE_PROFILES} --profile mihomo"
 
-# 启动前先校验既有容器的 bind mount 类型是否仍然成立。
-# Docker 在创建容器时会把挂载点的类型（文件 vs 目录）固化下来；若宿主侧路径类型变了
-# （典型场景：早期版本把 /data/opt/docker-cli/docker 误建成了目录，后续修复成文件），
-# 复用旧容器会直接启动失败：
+# 启动 Gateway，并对「挂载类型冲突」做一次自愈重试。
+#
+# 背景：Docker 在创建容器时会把 bind mount 的类型（文件 vs 目录）固化下来。
+# 若宿主侧路径类型后来变了（典型场景：早期版本把 /data/opt/docker-cli/docker
+# 误建成目录，后续修复成文件），复用旧容器会在容器初始化阶段直接失败：
 #   error mounting ".../docker" ... not a directory: Are you trying to mount
 #   a directory onto a file (or vice-versa)?
-# 这里主动探测一次，发现类型不符就删掉旧容器让 compose 重建，
-# 而不是让用户面对一个看不懂的 OCI runtime 错误。
-if docker inspect openclaw-gateway >/dev/null 2>&1; then
-  MOUNT_MISMATCH=false
-  while IFS='|' read -r SRC DST; do
-    [ -n "$SRC" ] && [ -n "$DST" ] || continue
-    # 宿主路径存在但不是普通文件/目录时跳过；只比对「存在且类型明确」的情况
-    if [ -f "$SRC" ] && [ -d "$DST" ] && ! [ -f "$DST" ]; then
-      MOUNT_MISMATCH=true; break
-    fi
-    if [ -d "$SRC" ] && [ -f "$DST" ]; then
-      MOUNT_MISMATCH=true; break
-    fi
-  done < <(docker inspect openclaw-gateway \
-             --format '{{range .Mounts}}{{.Source}}|{{.Destination}}{{println}}{{end}}' 2>/dev/null)
-  if $MOUNT_MISMATCH; then
-    warn "检测到既有容器的挂载点类型与宿主不一致，删除旧容器以便重建"
-    docker rm -f openclaw-gateway >/dev/null 2>&1 || true
-  fi
-fi
+# 这个错误以 exit 127 退出，读起来像"命令不存在"，完全指不到真实原因。
+#
+# 由于"容器创建时记录的挂载类型"无法从 inspect 可靠读出，
+# 采用最直接的办法：先正常 up；若输出里出现挂载类型冲突的签名，
+# 就删掉旧容器让 compose 按当前宿主类型重建一次。
+COMPOSE_LOG="$(mktemp)"
+docker compose -f "${COMPOSE_FILE}" ${COMPOSE_PROFILES} up -d >"${COMPOSE_LOG}" 2>&1 || true
+tail -3 "${COMPOSE_LOG}"
 
-docker compose -f "${COMPOSE_FILE}" ${COMPOSE_PROFILES} up -d 2>&1 || fail "Gateway 启动失败"
+if grep -qE "not a directory|Are you trying to mount" "${COMPOSE_LOG}"; then
+  warn "检测到容器挂载类型与宿主不一致，删除旧容器后重建"
+  docker rm -f openclaw-gateway >/dev/null 2>&1 || true
+  docker compose -f "${COMPOSE_FILE}" ${COMPOSE_PROFILES} up -d 2>&1 | tail -3 \
+    || { rm -f "${COMPOSE_LOG}"; fail "Gateway 启动失败"; }
+fi
+rm -f "${COMPOSE_LOG}"
+
+# 兜底：容器是否存在（Up 或 Restarting 都算存在，health 由后续逻辑判定）
+if ! docker inspect openclaw-gateway >/dev/null 2>&1; then
+  fail "Gateway 启动失败（容器未创建）"
+fi
 
 # 若后续还有需要 Gateway 重启才能生效的改动（如新增 provider、Telegram 接入），
 # 由 12.8 收尾统一重启确认 healthy；否则此处直接等待 Gateway ready。
@@ -859,6 +859,22 @@ else
   info "logrotate 不存在，跳过日志轮转配置"
 fi
 
+# ── 10.7a task-engine 文件落盘 ──────────────────────────────────────
+# 必须早于 10.7b 的 systemd 启动：te-daemon 的启动分支会检查
+# [ -f /data/state/workspace/task-engine/te_daemon_v2.py ]。
+# 若把落盘放在启动之后，该检查恒为假 → 单元装上了却从未 enable --now，
+# 表现为 systemctl is-active te-daemon = inactive，
+# 而安装日志只有"systemd 单元已安装"、没有"已启动"，极易被忽略。
+if $WITH_TASK_ENGINE; then
+  mkdir -p /data/state/workspace/task-engine
+  cp -r "$PROJECT_DIR/task-engine"/* /data/state/workspace/task-engine/ 2>/dev/null
+  chmod +x /data/state/workspace/task-engine/*.py /data/state/workspace/task-engine/*.sh 2>/dev/null || true
+  # 属主必须是容器内消费者（node = uid/gid 1000），否则 node 读不到 task.json，
+  # taskboard 巡检会直接抛 PermissionError（生产机已发生过一次）。
+  chown -R 1000:1000 /data/state/workspace/task-engine
+  ok "task-engine 组件就位（/data/state/workspace/task-engine）"
+fi
+
 # ── 10.7 运维/自愈组件 ──
 {
   step "10.7 安装运维/自愈组件"
@@ -1025,13 +1041,7 @@ CRONEOF_TAIL
 chmod 644 /etc/cron.d/openclaw-ops
 ok "运维 cron 矩阵就位（/etc/cron.d/openclaw-ops）"
 
-if $WITH_TASK_ENGINE; then
-  mkdir -p /data/state/workspace/task-engine
-  chown -R 1000:1000 /data/state/workspace/task-engine
-  cp -r "$PROJECT_DIR/task-engine"/* /data/state/workspace/task-engine/
-  chmod +x /data/state/workspace/task-engine/*.py /data/state/workspace/task-engine/*.sh 2>/dev/null || true
-  ok "task-engine 组件就位（/data/state/workspace/task-engine）"
-fi
+# 注：task-engine 文件落盘已提前到 §10.7a（必须早于 te-daemon 的启动检查）。
 
 # ── 10.8 沙箱镜像构建（开启 --with-sandbox 时）──
 # 沙箱镜像来自 OpenClaw 官方 scripts/sandbox-setup.sh（非本项目自研），
