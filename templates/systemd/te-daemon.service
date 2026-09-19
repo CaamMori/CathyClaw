@@ -1,0 +1,20 @@
+[Unit]
+Description=task-engine supervisor (te-daemon v2) — reconcile + stall alert
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+WorkingDirectory=/data/state/workspace/task-engine
+ExecStart=/usr/bin/python3 te_daemon_v2.py
+Environment=TE_DIR=/data/state/workspace/task-engine
+Environment=TE_INTERVAL=30
+Restart=always
+UMask=002
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=te-daemon
+
+[Install]
+WantedBy=multi-user.target

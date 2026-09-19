@@ -1,0 +1,18 @@
+[Unit]
+Description=OpenClaw health watchdog (ocwatch)
+Documentation=https://github.com/CaamMori/OpenClaw-CakeClaw
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/ocwatch.sh
+Restart=always
+RestartSec=5
+# 避免与 Docker 重启风暴叠加；标准输出进 journal
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ocwatch
+
+[Install]
+WantedBy=multi-user.target

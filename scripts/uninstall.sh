@@ -27,7 +27,14 @@ echo "[2/5] 删除 Nginx 配置..."
 rm -f /etc/nginx/sites-available/openclaw /etc/nginx/sites-enabled/openclaw 2>/dev/null || true
 nginx -t 2>/dev/null && systemctl reload nginx 2>/dev/null || true
 
-echo "[3/5] 清理 cron..."
+echo "[3/5] 停止并移除 systemd 服务..."
+for unit in ocwatch.service te-daemon.service openclaw-cdp-relay.service; do
+  systemctl disable --now "$unit" >/dev/null 2>&1 || true
+  rm -f "/etc/systemd/system/$unit"
+done
+systemctl daemon-reload >/dev/null 2>&1 || true
+
+echo "[3.5/5] 清理 cron..."
 # 新方式：移除 /etc/cron.d/ 下的 openclaw 任务文件（独立、精确，不用 grep 模糊匹配）
 rm -f /etc/cron.d/openclaw-ops /etc/cron.d/openclaw-backup /etc/cron.d/openclaw-health-check /etc/cron.d/openclaw-watchdog /etc/cron.d/openclaw-trends /etc/cron.d/openclaw-cert-check /etc/cron.d/openclaw-audit 2>/dev/null || true
 # 兼容旧版本（把任务写在 root crontab 里的版本）清理
@@ -35,6 +42,7 @@ crontab -l 2>/dev/null | grep -v -E 'openclaw|watchdog|health-check|trends|audit
 
 echo "[4/5] 删除数据目录..."
 rm -rf /data/state /data/backups/openclaw-state /data/logs/health-check /data/logs/watchdog /data/logs/trends /data/logs/audit 2>/dev/null || true
+rm -f /usr/local/bin/ocwatch.sh /usr/local/bin/cdp-relay.js /usr/local/bin/openclaw-cdp-relay.sh /usr/local/bin/ensure-sandbox-paths.sh /usr/local/bin/selfcheck-full-cron.sh 2>/dev/null || true
 rm -rf /data/scripts/alert.sh /data/scripts/watchdog.sh /data/scripts/health-check.sh /data/scripts/trends.sh /data/scripts/audit.sh /data/scripts/backup.sh /data/scripts/backup-openclaw.sh /data/scripts/cert-check.sh /data/scripts/changelog.sh /data/scripts/kbase.sh /data/scripts/failover.sh /data/scripts/sync.sh 2>/dev/null || true
 rm -rf /data/knowledge 2>/dev/null || true
 rm -f /root/openclaw-credentials.txt /data/logs/sync.log /data/logs/sync-target 2>/dev/null || true
@@ -45,5 +53,5 @@ rm -f /data/etc/openclaw/docker-compose.yml /tmp/openclaw-compose.yml 2>/dev/nul
 
 echo ""
 echo "openclaw 已卸载。"
-echo "如需删除 Docker 镜像: docker rmi ghcr.io/openclaw/openclaw:2026.7.1"
+echo "如需删除 Docker 镜像: docker rmi ghcr.io/openclaw/openclaw:YOUR_TAG openclaw-sandbox:bookworm-slim openclaw-sandbox-browser:bookworm-slim"
 echo "workspace 保留在 /data/workspace/（手动删除: rm -rf /data/workspace）"

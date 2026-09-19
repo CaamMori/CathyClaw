@@ -645,6 +645,12 @@ fi
   chmod +x /data/opt/openclaw-patches/*.sh
   ok "openclaw-patches 安装到 /data/opt/openclaw-patches"
 
+  # 2.1) cdp-relay.js 需要被 gateway 容器内调用；同时保留宿主机副本供 systemd 拉起
+  if [ -f "$PROJECT_DIR/scripts/ops/cdp-relay.js" ]; then
+    cp "$PROJECT_DIR/scripts/ops/cdp-relay.js" /usr/local/bin/cdp-relay.js
+    chmod 644 /usr/local/bin/cdp-relay.js
+  fi
+
   # 3) docker CLI 包装（沙箱内需要 docker，但不直接暴露宿主 socket 权限）
   mkdir -p /data/opt/docker-cli
   HOST_DOCKER="$(command -v docker 2>/dev/null || echo /usr/bin/docker)"
@@ -684,6 +690,54 @@ if $WITH_MIHOMO; then
   fi
 fi
 
+# ── systemd 常驻服务（对齐生产：ocwatch / te-daemon / cdp-relay）──
+# 为什么用 systemd 而不是 cron：这三者是「常驻 + 自愈 + 秒级响应」，
+# cron 只能做到分钟级轮询且无进程守卫（挂了不自拉起）。cron 矩阵负责周期性巡检，
+# systemd 负责常驻守护，两者互补而非替代。
+install_systemd_unit() {
+  local unit="$1" src="$2"
+  [ -f "$src" ] || { warn "缺少 systemd 模板 $unit，跳过"; return 0; }
+  cp "$src" "/etc/systemd/system/$unit"
+  ok "systemd 单元已安装: $unit"
+}
+
+if command -v systemctl >/dev/null 2>&1; then
+  install_systemd_unit "ocwatch.service"            "$PROJECT_DIR/templates/systemd/ocwatch.service"
+  install_systemd_unit "openclaw-cdp-relay.service" "$PROJECT_DIR/templates/systemd/openclaw-cdp-relay.service"
+
+  # te-daemon 依赖 task-engine 目录，仅在启用 task-engine 时安装
+  if $WITH_TASK_ENGINE; then
+    install_systemd_unit "te-daemon.service" "$PROJECT_DIR/templates/systemd/te-daemon.service"
+  fi
+
+  systemctl daemon-reload >/dev/null 2>&1 || true
+
+  # ocwatch：常驻健康监控（gateway/mihomo/browser/磁盘/内存 + 沙箱路径自愈）
+  if [ -f /usr/local/bin/ocwatch.sh ]; then
+    chmod +x /usr/local/bin/ocwatch.sh
+    systemctl enable --now ocwatch.service >/dev/null 2>&1 \
+      && ok "ocwatch.service 已启动（60s 健康监控）" \
+      || warn "ocwatch.service 启动失败，请 systemctl status ocwatch 排查"
+  fi
+
+  # cdp-relay：浏览器 CDP 回环转发（沙箱 browser 链路，按需拉起）
+  if [ -f /usr/local/bin/openclaw-cdp-relay.sh ]; then
+    chmod +x /usr/local/bin/openclaw-cdp-relay.sh
+    systemctl enable --now openclaw-cdp-relay.service >/dev/null 2>&1 \
+      && ok "openclaw-cdp-relay.service 已启动" \
+      || warn "openclaw-cdp-relay.service 启动失败（无沙箱浏览器时可忽略）"
+  fi
+
+  # te-daemon：任务引擎守护（reconcile + 停滞告警）
+  if $WITH_TASK_ENGINE && [ -f /data/state/workspace/task-engine/te_daemon_v2.py ]; then
+    systemctl enable --now te-daemon.service >/dev/null 2>&1 \
+      && ok "te-daemon.service 已启动（任务引擎守护）" \
+      || warn "te-daemon.service 启动失败，请 systemctl status te-daemon 排查"
+  fi
+else
+  warn "未检测到 systemd，跳过常驻服务安装（ocwatch/te-daemon/cdp-relay）"
+fi
+
 # 统一 cron 矩阵（cron.d/openclaw-ops），无条件写入（重跑即覆盖）
 cat > /etc/cron.d/openclaw-ops << 'CRONEOF'
 # OpenClaw 运维矩阵 — 由安装脚本生成，重跑即覆盖
@@ -709,6 +763,8 @@ cat > /etc/cron.d/openclaw-ops << 'CRONEOF'
 30 4 * * * root /usr/local/bin/gen-env-snapshot.sh
 # 任务停滞看门狗（24h+ 去重告警）
 17 */6 * * * root cd /data/state/workspace/task-engine && ./stale_alert.sh
+# 沙箱 bind mount 源路径自愈（gateway 用容器内视角路径做 Source 会指向错误目录）
+*/5 * * * * root /usr/local/bin/ensure-sandbox-paths.sh >/dev/null 2>&1
 CRONEOF
 chmod 644 /etc/cron.d/openclaw-ops
 ok "运维 cron 矩阵就位（/etc/cron.d/openclaw-ops）"
@@ -719,6 +775,67 @@ if $WITH_TASK_ENGINE; then
   cp -r "$PROJECT_DIR/task-engine"/* /data/state/workspace/task-engine/
   chmod +x /data/state/workspace/task-engine/*.py /data/state/workspace/task-engine/*.sh 2>/dev/null || true
   ok "task-engine 组件就位（/data/state/workspace/task-engine）"
+fi
+
+# ── 10.8 沙箱镜像构建（开启 --with-sandbox 时）──
+# 沙箱镜像来自 OpenClaw 官方 scripts/sandbox-setup.sh（非本项目自研），
+# 本步骤负责：① 从发行版拉官方构建脚本 ② 构建基础 + 浏览器镜像 ③ 打 skills 增强层。
+if $WITH_SANDBOX; then
+  step "10.8 构建沙箱镜像"
+  SANDBOX_BUILD_DIR="/data/opt/sandbox-build"
+  if [ -d "$SANDBOX_BUILD_DIR" ] && [ -f "$SANDBOX_BUILD_DIR/Dockerfile.sandbox" ]; then
+    info "沙箱构建目录已存在，跳过拉取"
+  else
+    mkdir -p "$SANDBOX_BUILD_DIR"
+    # 官方构建脚本随 openclaw 源码分发；优先从 GitHub 拉取 scripts/ 下的构建文件。
+    OW_SRC_REF="${OPENCLAW_SRC_REF:-main}"
+    OW_BASE="https://raw.githubusercontent.com/openclaw/openclaw/${OW_SRC_REF}"
+    _fetch() {
+      local rel="$1" dst="$SANDBOX_BUILD_DIR/$1"
+      mkdir -p "$(dirname "$dst")"
+      if curl -fsSL --max-time 30 "${OW_BASE}/${rel}" -o "$dst" 2>/dev/null; then
+        return 0
+      fi
+      return 1
+    }
+    ok_fetch=true
+    for f in Dockerfile.sandbox Dockerfile.sandbox-browser Dockerfile.sandbox-common \
+             scripts/sandbox-setup.sh scripts/sandbox-browser-setup.sh scripts/sandbox-common-setup.sh; do
+      _fetch "$f" || { ok_fetch=false; warn "拉取失败: $f"; }
+    done
+    if ! $ok_fetch; then
+      warn "官方沙箱构建文件拉取不全（可能需要代理）。可稍后手动补齐 $SANDBOX_BUILD_DIR 后重跑。"
+    fi
+  fi
+
+  if [ -f "$SANDBOX_BUILD_DIR/scripts/sandbox-setup.sh" ]; then
+    # 基础沙箱镜像（sandbox 的缺省 image）
+    if ! docker image inspect "openclaw-sandbox:bookworm-slim" >/dev/null 2>&1; then
+      ( cd "$SANDBOX_BUILD_DIR" && bash scripts/sandbox-setup.sh ) \
+        && ok "基础沙箱镜像构建完成（openclaw-sandbox:bookworm-slim）" \
+        || warn "基础沙箱镜像构建失败，沙箱功能将不可用"
+    else
+      info "基础沙箱镜像已存在"
+    fi
+  fi
+
+  if [ -f "$SANDBOX_BUILD_DIR/scripts/sandbox-browser-setup.sh" ]; then
+    if ! docker image inspect "openclaw-sandbox-browser:bookworm-slim" >/dev/null 2>&1; then
+      ( cd "$SANDBOX_BUILD_DIR" && bash scripts/sandbox-browser-setup.sh ) \
+        && ok "浏览器沙箱镜像构建完成" \
+        || warn "浏览器沙箱镜像构建失败，浏览器工具将不可用"
+    else
+      info "浏览器沙箱镜像已存在"
+    fi
+  fi
+
+  # 镜像加速：若配置了 SANDBOX_IMAGE_MIRROR，则重打 tag 指向镜像站
+  if [ -n "${SANDBOX_IMAGE_MIRROR:-}" ]; then
+    for img in openclaw-sandbox:bookworm-slim openclaw-sandbox-browser:bookworm-slim; do
+      docker tag "$img" "${SANDBOX_IMAGE_MIRROR}/${img}" 2>/dev/null || true
+    done
+    ok "沙箱镜像已打镜像站 tag: ${SANDBOX_IMAGE_MIRROR}"
+  fi
 fi
 
 # ── 11. 凭证摘要 ──

@@ -1,0 +1,15 @@
+[Unit]
+Description=OpenClaw sandbox browser CDP loopback relay
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/openclaw-cdp-relay.sh
+Restart=always
+RestartSec=5
+StandardOutput=append:/var/log/openclaw-cdp-relay.log
+StandardError=append:/var/log/openclaw-cdp-relay.log
+
+[Install]
+WantedBy=multi-user.target
