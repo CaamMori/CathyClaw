@@ -40,38 +40,6 @@ prompt() {
   printf -v "${variable}" '%s' "${value}"
 }
 
-# Codex/ChatGPT Subscription 中转的 /models 列表可能包含当前账号无权调用的模型。
-# 在写入 Provider 前做一次最小 Responses 请求；失败时不落盘无效配置。
-probe_codex_responses_model() {
-  local base_url="$1" api_key="$2" model_id="$3"
-  P_URL="${base_url}" P_KEY="${api_key}" P_MODEL="${model_id}" python3 - <<'PYEOF'
-import json, os, sys, urllib.error, urllib.request
-url = os.environ["P_URL"].rstrip("/") + "/responses"
-body = json.dumps({
-    "model": os.environ["P_MODEL"],
-    # This upstream requires streaming Responses requests with array-form input.
-    "stream": True,
-    "input": [{
-        "role": "user",
-        "content": [{"type": "input_text", "text": "Reply exactly OK."}],
-    }],
-}).encode()
-req = urllib.request.Request(url, data=body, method="POST", headers={
-    "Authorization": "Bearer " + os.environ["P_KEY"],
-    "Content-Type": "application/json",
-})
-try:
-    with urllib.request.urlopen(req, timeout=25) as response:
-        if 200 <= response.status < 300:
-            sys.exit(0)
-except urllib.error.HTTPError as error:
-    detail = error.read().decode("utf-8", errors="replace").replace("\n", " ")
-    print(f"HTTP {error.code}: {detail[:300]}", file=sys.stderr)
-except Exception as error:
-    print(f"{type(error).__name__}: {error}", file=sys.stderr)
-sys.exit(1)
-PYEOF
-}
 
 # 等待 Gateway 容器 healthy（与 compose healthcheck 对齐，覆盖 start_period 120s）。
 # 不只看容器 Up（Up 可能仍 starting），而看 docker inspect Health.Status；异常则 fail。
@@ -124,9 +92,6 @@ wait_gateway_ready() {
 
 # ── 0. 参数解析 ──
 PHASE2=true; PHASE3=true
-CODEX_FIX=false
-CODEX_FIX_B=false
-OPENCODE_INSTALL=false
 HELP=false
 NEED_RESTART=false
 WITH_MIHOMO=false
@@ -137,22 +102,18 @@ for arg in "$@"; do
   case "$arg" in
     --no-phase2) PHASE2=false ;;
     --no-phase3) PHASE3=false ;;
-    --with-codex-fix) CODEX_FIX=true ;;
-    --with-codex-fix-b) CODEX_FIX_B=true ;;
     --with-mihomo) WITH_MIHOMO=true ;;
     --with-task-engine) WITH_TASK_ENGINE=true ;;
     --with-watchdog) WITH_WATCHDOG=true ;;
     --with-sandbox) WITH_SANDBOX=true ;;
     --help|-h)   HELP=true ;;
-    *) fail "未知参数: $arg。支持的参数: --no-phase2 --no-phase3 --with-codex-fix --with-codex-fix-b --with-mihomo --with-task-engine --with-watchdog --with-sandbox --help" ;;
+    *) fail "未知参数: $arg。支持的参数: --no-phase2 --no-phase3 --with-mihomo --with-task-engine --with-watchdog --with-sandbox --help" ;;
   esac
 done
 if $HELP; then
   echo "用法: sudo ./scripts/install.sh [选项]"
   echo "  --no-phase2         跳过自愈/监控"
   echo "  --no-phase3         跳过审计"
-  echo "  --with-codex-fix    启用 Codex 修复（方案 A）"
-  echo "  --with-codex-fix-b  启用 Codex 修复（方案 B）"
   echo "  --with-mihomo       启用 mihomo TUN 代理 sidecar"
   echo "  --with-task-engine  启用任务引擎（taskctl + taskboard + stale guard）"
   echo "  --with-watchdog     启用 recovery-watchdog 容器"
@@ -212,34 +173,12 @@ SSH_PORT="${SSH_PORT:-22}"
 BACKUP_RETENTION_DAYS="${BACKUP_RETENTION_DAYS:-7}"
 CONN_LIMIT="${CONN_LIMIT:-15}"
 SWAP_SIZE="${SWAP_SIZE:-2G}"
-# Codex Responses 修复（可选）：见 patches/ 与 README
-# 两种方案，二选一（切勿同时启用）：
-#   --with-codex-fix  （CODEX_FIX=1）   env 白名单方案，不改 api 判定，需模型 api 已是
-#                                     openai-chatgpt-responses / openclaw-openai-responses-transport
-#   --with-codex-fix-b（CODEX_FIX_B=1）改 dist 两处（含 api=openai-responses），无需模型 api 特殊值
-# 二者都依赖环境变量 OPENCLAW_CODEX_RESPONSES_PROVIDERS 指定 provider 名（不硬编码）。
-if [ "${CODEX_FIX:-}" = "1" ]; then CODEX_FIX=true; fi
-if [ "${CODEX_FIX_B:-}" = "1" ]; then CODEX_FIX_B=true; fi
-if $CODEX_FIX && $CODEX_FIX_B; then fail "--with-codex-fix 与 --with-codex-fix-b 不能同时启用"; fi
-CODEX_FIX_PATCH_SRC="${CODEX_FIX_PATCH_SRC:-$PROJECT_DIR/patches/openai-transport-stream-codex-env.js}"
-CODEX_FIX_B_PATCH_SRC="${CODEX_FIX_B_PATCH_SRC:-$PROJECT_DIR/patches/openai-transport-stream-codex-openai-responses.js}"
-CODEX_FIX_PATCH_DST="${CODEX_FIX_PATCH_DST:-/app/dist/openai-transport-stream-codex.js}"
-CODEX_RESPONSES_PROVIDERS="${CODEX_RESPONSES_PROVIDERS:-}"
 # Telegram 机器人接入（可选）：见 README
 # 交互环境默认询问；非交互环境用 TELEGRAM_BOT_TOKEN / TELEGRAM_ALLOW_FROM 环境变量。
 TELEGRAM_TOKEN_DIR="/data/etc/openclaw/telegram"
 TELEGRAM_TOKEN_FILE="${TELEGRAM_TOKEN_DIR}/bot-token"
-if [ "${OPENCODE_INSTALL:-}" = "1" ]; then OPENCODE_INSTALL=true; fi
 TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
 TELEGRAM_ALLOW_FROM="${TELEGRAM_ALLOW_FROM:-}"
-# 重跑安装脚本会重新渲染 Compose 模板；在覆盖前记录已生效的 Codex 补丁，稍后恢复挂载并跳过交互。
-CODEX_PATCH_HOST_PATH="/data/etc/openclaw/patches/$(basename "${CODEX_FIX_PATCH_DST}")"
-CODEX_COMPOSE_FILE="/data/etc/openclaw/docker-compose.yml"
-CODEX_FIX_PREVIOUSLY_INSTALLED=false
-if [ -f "${CODEX_PATCH_HOST_PATH}" ] && [ -f "${CODEX_COMPOSE_FILE}" ] && \
-   grep -Fq -- "- ${CODEX_PATCH_HOST_PATH}:${CODEX_FIX_PATCH_DST}" "${CODEX_COMPOSE_FILE}"; then
-  CODEX_FIX_PREVIOUSLY_INSTALLED=true
-fi
 
 step "0. 系统检测"
 echo "OS: $(. /etc/os-release && echo "$PRETTY_NAME")"
@@ -435,21 +374,6 @@ if [ -z "${OPENCLAW_GATEWAY_TOKEN:-}" ] || [ "$OPENCLAW_GATEWAY_TOKEN" = "***" ]
   fi
 fi
 cp "$PROJECT_DIR/.env" /data/etc/openclaw/runtime.env
-# Codex Responses 修复（可选）：把 env 白名单写入 runtime.env，让指定 provider 走
-# Codex Responses 路径。provider 名由 CODEX_RESPONSES_PROVIDERS 指定（逗号分隔）。
-# 两种方案（--with-codex-fix 与 --with-codex-fix-b）都需要这一步。
-# 幂等：先删旧行再去重，避免重跑 install.sh 时重复追加。
-if $CODEX_FIX || $CODEX_FIX_B; then
-  grep -v '^OPENCLAW_CODEX_RESPONSES_PROVIDERS=' /data/etc/openclaw/runtime.env > /data/etc/openclaw/runtime.env.tmp 2>/dev/null || true
-  if [ -n "${CODEX_RESPONSES_PROVIDERS}" ]; then
-    echo "OPENCLAW_CODEX_RESPONSES_PROVIDERS=${CODEX_RESPONSES_PROVIDERS}" >> /data/etc/openclaw/runtime.env.tmp
-    mv /data/etc/openclaw/runtime.env.tmp /data/etc/openclaw/runtime.env
-    info "已写入 OPENCLAW_CODEX_RESPONSES_PROVIDERS=${CODEX_RESPONSES_PROVIDERS}"
-  else
-    mv /data/etc/openclaw/runtime.env.tmp /data/etc/openclaw/runtime.env
-    info "未设置 CODEX_RESPONSES_PROVIDERS，稍后在 provider 配置后手动填入"
-  fi
-fi
 chmod 600 /data/etc/openclaw/runtime.env
 chown -R 1000:1000 /data/state /data/workspace 2>/dev/null || true
 ok "密钥已写入 /data/etc/openclaw/runtime.env"
@@ -499,106 +423,15 @@ print("docker.sock mount removed (--without-sandbox)")
 PYEOF
 fi
 
-# 保留重跑前已验证生效的 Codex 补丁挂载。模板本身不含该可选挂载，若不恢复会导致
-# 重跑安装时先丢失补丁、随后重复弹出交互配置。
-if $CODEX_FIX_PREVIOUSLY_INSTALLED; then
-  CODEX_MOUNT_SRC="${CODEX_PATCH_HOST_PATH}" CODEX_MOUNT_DST="${CODEX_FIX_PATCH_DST}" \
-  python3 - "${COMPOSE_FILE}" << 'PYEOF'
-import os, sys
-path = sys.argv[1]
-entry = "      - " + os.environ["CODEX_MOUNT_SRC"] + ":" + os.environ["CODEX_MOUNT_DST"]
-with open(path, encoding="utf-8") as f:
-    lines = f.readlines()
-if entry + chr(10) not in lines:
-    for i, line in enumerate(lines):
-        if line.startswith("    env_file:"):
-            lines.insert(i, entry + chr(10))
-            break
-    else:
-        raise SystemExit("Codex mount restore failed: env_file section not found")
-    with open(path, "w", encoding="utf-8") as f:
-        f.writelines(lines)
-PYEOF
-  NEED_RESTART=true
-  info "检测到已安装 Codex Responses 补丁，已保留挂载并跳过后续补丁交互"
-fi
-
-# Codex Responses 修复（可选）：把 dist 补丁文件复制到持久化目录并注入 compose 挂载。
-# 两个方案选一个（互斥已在上方校验）：
-#   --with-codex-fix   → 用 env 白名单产物（不改 api 判定，需模型 api 已是 Codex 专属值）
-#   --with-codex-fix-b → 用 openai-responses 产物（额外支持 api=openai-responses）
-# 补丁均从官方 dist（2026.7.1）派生，provider 名不硬编码（由环境变量指定）。
-# 未启用任何方案时完全不碰 compose，与默认部署完全一致。
-if $CODEX_FIX || $CODEX_FIX_B; then
-  if $CODEX_FIX_B; then
-    CODEX_PATCH_SRC="${CODEX_FIX_B_PATCH_SRC}"
-  else
-    CODEX_PATCH_SRC="${CODEX_FIX_PATCH_SRC}"
-  fi
-  [ -f "${CODEX_PATCH_SRC}" ] || fail "Codex 修复补丁文件不存在: ${CODEX_PATCH_SRC}"
-  mkdir -p /data/etc/openclaw/patches
-  cp "${CODEX_PATCH_SRC}" /data/etc/openclaw/patches/"$(basename "${CODEX_FIX_PATCH_DST}")"
-  chmod 644 /data/etc/openclaw/patches/"$(basename "${CODEX_FIX_PATCH_DST}")"
-  # 用 python 往 volumes 段末尾插入一行 bind mount（源=宿主机持久化文件，目标=容器 dist 文件）
-  CODEX_MOUNT_SRC="/data/etc/openclaw/patches/$(basename "${CODEX_FIX_PATCH_DST}")" \
-  CODEX_MOUNT_DST="${CODEX_FIX_PATCH_DST}" \
-  python3 - "${COMPOSE_FILE}" << 'PYEOF'
-import sys, os, tempfile
-path = sys.argv[1]
-mount_src = os.environ["CODEX_MOUNT_SRC"]
-mount_dst = os.environ["CODEX_MOUNT_DST"]
-with open(path, encoding="utf-8") as f:
-    lines = f.readlines()
-new_lines = []
-injected = False
-volumes_key_idx = None
-for i, line in enumerate(lines):
-    if not injected and line.strip() == "volumes:":
-        volumes_key_idx = i
-    new_lines.append(line)
-# 找到 volumes: 段内最后一个以 "  - " 开头的挂载行，在其后插入新挂载
-if volumes_key_idx is not None:
-    insert_after = None
-    for j in range(volumes_key_idx + 1, len(new_lines)):
-        nl = new_lines[j]
-        if nl.startswith("    ") and not nl.strip() == "":
-            if nl.strip().startswith("-"):
-                insert_after = j
-            else:
-                break
-        elif nl.strip() == "":
-            break
-        else:
-            break
-    if insert_after is None:
-        insert_after = volumes_key_idx
-    indent = "      "
-    new_lines.insert(insert_after + 1, indent + "- " + mount_src + ":" + mount_dst + "\n")
-    injected = True
-with open(path, "w", encoding="utf-8") as f:
-    f.writelines(new_lines)
-print("injected mount" if injected else "ERROR: volumes section not found")
-PYEOF
-  if $CODEX_FIX_B; then
-    ok "Codex 修复 B 已启用（挂载 ${CODEX_FIX_PATCH_DST}，支持 api=openai-responses）"
-  else
-    ok "Codex 修复已启用（挂载 ${CODEX_FIX_PATCH_DST}）"
-  fi
-  # 补丁挂载需重启才生效；打标记，由 12.8 收尾统一重启（避免此处与后续配置改动重复重启）
-  NEED_RESTART=true
-else
-  info "未启用 Codex 修复（--with-codex-fix / --with-codex-fix-b 未指定）"
-fi
-
 COMPOSE_PROFILES=""
 $WITH_MIHOMO && COMPOSE_PROFILES="${COMPOSE_PROFILES} --profile mihomo"
 $WITH_WATCHDOG && COMPOSE_PROFILES="${COMPOSE_PROFILES} --profile watchdog"
 docker compose -f "${COMPOSE_FILE}" ${COMPOSE_PROFILES} up -d 2>&1 || fail "Gateway 启动失败"
 
-# 若无后续配置改动（未启用 Codex 补丁），在此等待 Gateway healthy；
-# 若已启用 Codex 补丁（NEED_RESTART=true），则只拉起容器、跳过等待，由 12.8 统一重启并确认 healthy。
+# 若后续还有需要 Gateway 重启才能生效的改动（如新增 provider、Telegram 接入），
+# 由 12.8 收尾统一重启确认 healthy；否则此处直接等待 Gateway ready。
 if $NEED_RESTART; then
-  info "已启用 Codex 补丁，暂不等待 healthy，将由 12.8 收尾统一重启确认"
+  info "有待生效的改动，暂不等待 healthy，将由 12.8 收尾统一重启确认"
 else
   wait_gateway_ready
 fi
@@ -929,48 +762,6 @@ for f in environment decisions incidents projects; do
   touch "/data/knowledge/${f}.md" 2>/dev/null || true
 done
 
-# ── 12.4 Codex Responses 修复（可选）──
-# 独立于 provider 配置先询问一次：这样用户即使稍后跳过 provider 配置，或通过控制台配置
-# provider，也能在首装时完成补丁挂载。provider 名用于 Responses 路径白名单。
-step "12.4 Codex Responses 修复（可选）"
-configure_codex_fix_interactive() {
-  if $CODEX_FIX_PREVIOUSLY_INSTALLED; then
-    info "Codex Responses 补丁已安装且挂载完整，跳过交互配置"
-    return 0
-  fi
-  echo ""
-  echo "  是否启用 Codex / ChatGPT Subscription（type=57）兼容补丁？直接回车跳过。"
-  echo "  仅当后端只接受 /v1/responses 且拒绝 system prompt 时需要。"
-  prompt "  是否启用 (y/N): " DO_CODEX_FIX
-  case "${DO_CODEX_FIX}" in
-    y|Y|yes|YES) : ;;
-    *) info "跳过 Codex Responses 修复"; return 0 ;;
-  esac
-
-  echo "    A) 方案 A — 仅 env 白名单，不改 api，需 api 已是 Codex 专属值"
-  echo "    B) 方案 B（推荐）— 支持 api=openai-responses，覆盖绝大多数自定义 Codex 中转"
-  prompt "  选择补丁方案 (A/B，默认 B): " CODEX_PATCH_CHOICE
-  case "${CODEX_PATCH_CHOICE:-B}" in
-    a|A|1)
-      CODEX_FIX=true
-      info "已选择方案 A"
-      ;;
-    *)
-      CODEX_FIX_B=true
-      info "已选择方案 B"
-      ;;
-  esac
-
-  info "Provider 名会在后续模型 Provider 配置中写入白名单；已有 Provider 可通过 CODEX_RESPONSES_PROVIDERS 预设。"
-}
-
-if $INTERACTIVE && ! $CODEX_FIX && ! $CODEX_FIX_B; then
-  configure_codex_fix_interactive
-elif $CODEX_FIX || $CODEX_FIX_B; then
-  info "已通过参数或 .env 启用 Codex Responses 修复"
-else
-  info "非交互环境，未设置 Codex 修复开关，跳过"
-fi
 
 # ── 12.5 模型 Provider 配置（交互）──
 # 引导用户选择哪家 API（OpenAI / Claude / Azure / OpenAI 兼容），按各家预设好 baseUrl 默认值、
@@ -1035,119 +826,6 @@ configure_provider() {
     P_API_VERSION="${P_API_VERSION:-2024-06-01}"
   fi
 
-  # 类型 4（OpenAI 兼容格式）：判断是否 Codex（type=57）后端（如 ChatGPT Subscription 中转）
-  # 如果是，则引导用户选择补丁方案，并自动设置 P_API + 白名单
-  CODECX_DETECTED=false
-  if [ "${P_TYPE}" = "4" ]; then
-    echo ""
-    echo "  该后端是否为 ChatGPT Subscription / Codex（type=57）中转？"
-    echo "  （特征：只在 /v1/responses 收发，拒绝 system prompt，常见于自定义中转）"
-    prompt "  是否为 Codex 后端 (y/N): " DO_CODEX
-    case "${DO_CODEX}" in
-      y|Y|yes|YES)
-        CODECX_DETECTED=true
-        if $CODEX_FIX || $CODEX_FIX_B; then
-          # 已在 12.4 或通过参数/.env 选择方案；此处仅套用 api 并补当前 provider 白名单。
-          if $CODEX_FIX_B; then
-            P_API="openai-responses"
-            CODECX_PATCH_SRC="${CODEX_FIX_B_PATCH_SRC}"
-            info "复用已选择的方案 B：api 设为 openai-responses"
-          else
-            CODECX_PATCH_SRC="${CODEX_FIX_PATCH_SRC}"
-            info "复用已选择的方案 A：仅 env 白名单补丁"
-          fi
-        else
-          echo ""
-          echo "  Codex 后端需要补丁修复 system prompt 兼容。已提供两种补丁方案："
-          echo "    A) 方案 A — 仅 env 白名单，不改 api，需 api 已是 Codex 专属值"
-          echo "    B) 方案 B（推荐）— 改 api 为 openai-responses，覆盖绝大多数自定义 Codex 中转"
-          prompt "  选择补丁方案 (A/B，默认 B): " CODECX_PATCH
-          CODECX_PATCH="${CODECX_PATCH:-B}"
-          case "${CODECX_PATCH}" in
-            a|A|1)
-              CODECX_PATCH_SRC="${CODEX_FIX_PATCH_SRC}"
-              info "已选择方案 A：仅 env 白名单补丁"
-              ;;
-            *)
-              P_API="openai-responses"
-              CODECX_PATCH_SRC="${CODEX_FIX_B_PATCH_SRC}"
-              info "已选择方案 B：api 设为 openai-responses"
-              ;;
-          esac
-        fi
-        # 将当前 provider 名加入白名单
-        if [ -n "${P_NAME}" ]; then
-          if [ -z "${CODEX_RESPONSES_PROVIDERS}" ]; then
-            CODEX_RESPONSES_PROVIDERS="${P_NAME}"
-          else
-            case ",${CODEX_RESPONSES_PROVIDERS}," in
-              *",${P_NAME},"*) : ;;
-              *) CODEX_RESPONSES_PROVIDERS="${CODEX_RESPONSES_PROVIDERS},${P_NAME}" ;;
-            esac
-          fi
-        fi
-        # 执行补丁挂载：复制 patch 文件 + 注入 compose volumes
-        if [ -f "${CODECX_PATCH_SRC}" ]; then
-          mkdir -p /data/etc/openclaw/patches
-          cp "${CODECX_PATCH_SRC}" /data/etc/openclaw/patches/"$(basename "${CODEX_FIX_PATCH_DST}")"
-          chmod 644 /data/etc/openclaw/patches/"$(basename "${CODEX_FIX_PATCH_DST}")"
-          CODEX_MOUNT_SRC="/data/etc/openclaw/patches/$(basename "${CODEX_FIX_PATCH_DST}")" \
-          CODEX_MOUNT_DST="${CODEX_FIX_PATCH_DST}" \
-          python3 - /data/etc/openclaw/docker-compose.yml << 'PYEOF'
-import sys, os
-path = sys.argv[1]
-mount_src = os.environ["CODEX_MOUNT_SRC"]
-mount_dst = os.environ["CODEX_MOUNT_DST"]
-vol_entry = "      - " + mount_src + ":" + mount_dst
-with open(path, encoding="utf-8") as f:
-    lines = f.readlines()
-# 幂等：如果已有相同的 src:dst 挂载行（可能来自 step 6 的 --with-codex-fix-b），则不再注入。
-for line in lines:
-    if line.strip() == vol_entry.strip():
-        print("exists")
-        sys.exit(0)
-new_lines = []
-volumes_key_idx = None
-for i, line in enumerate(lines):
-    if not volumes_key_idx and line.strip() == "volumes:":
-        volumes_key_idx = i
-    new_lines.append(line)
-if volumes_key_idx is not None:
-    insert_after = None
-    for j in range(volumes_key_idx + 1, len(new_lines)):
-        nl = new_lines[j]
-        if nl.startswith("    ") and nl.strip() != "":
-            if nl.strip().startswith("-"):
-                insert_after = j
-            else:
-                break
-        elif nl.strip() == "":
-            break
-        else:
-            break
-    if insert_after is None:
-        insert_after = volumes_key_idx
-    new_lines.insert(insert_after + 1, vol_entry + "\n")
-with open(path, "w", encoding="utf-8") as f:
-    f.writelines(new_lines)
-print("injected")
-PYEOF
-          ok "补丁已挂载到 docker-compose.yml"
-        else
-          info "补丁文件 ${CODECX_PATCH_SRC} 不存在，跳过挂载（请手动处理）"
-        fi
-        # 写白名单到 runtime.env
-        if [ -n "${CODEX_RESPONSES_PROVIDERS}" ]; then
-          grep -v '^OPENCLAW_CODEX_RESPONSES_PROVIDERS=' /data/etc/openclaw/runtime.env > /data/etc/openclaw/runtime.env.tmp 2>/dev/null || true
-          echo "OPENCLAW_CODEX_RESPONSES_PROVIDERS=${CODEX_RESPONSES_PROVIDERS}" >> /data/etc/openclaw/runtime.env.tmp
-          mv /data/etc/openclaw/runtime.env.tmp /data/etc/openclaw/runtime.env
-          chmod 600 /data/etc/openclaw/runtime.env
-          info "已写入 CODEX_RESPONSES_PROVIDERS=${CODEX_RESPONSES_PROVIDERS}"
-        fi
-        ;;
-      *) : ;;
-    esac
-  fi
 
   # 自动拉取模型列表（非交互环境或拉取失败则退化为手动填一个模型 id）
   echo ""
@@ -1205,22 +883,6 @@ except Exception:
     sys.exit(0)
 PYEOF
 
-  # Codex /models 返回的候选不等于当前 ChatGPT Subscription 账号可调用的模型。
-  # 在展示菜单前逐一真实探测，只保留成功响应的模型。
-  if [ "${CODECX_DETECTED:-false}" = "true" ] && [ -s /tmp/cakeclaw-models.txt ]; then
-    : > /tmp/cakeclaw-codex-models.txt
-    while IFS= read -r model_id; do
-      [ -n "${model_id}" ] || continue
-      info "验证 Codex 模型可用性: ${model_id}"
-      if probe_codex_responses_model "${P_URL}" "${P_KEY}" "${model_id}"; then
-        printf '%s\n' "${model_id}" >> /tmp/cakeclaw-codex-models.txt
-      else
-        info "已过滤当前账号不可用的 Codex 模型: ${model_id}"
-      fi
-    done < /tmp/cakeclaw-models.txt
-    mv /tmp/cakeclaw-codex-models.txt /tmp/cakeclaw-models.txt
-    [ -s /tmp/cakeclaw-models.txt ] || { info "没有通过当前 Codex 账号验证的模型，取消 provider"; rm -f /tmp/cakeclaw-models.txt; return 0; }
-  fi
 
   # 让用户勾选模型
   if [ -s /tmp/cakeclaw-models.txt ]; then
@@ -1250,18 +912,6 @@ PYEOF
 
   [ -n "${P_MODELS}" ] || { info "未选择任何模型，取消 provider"; return 0; }
 
-  # /models 能列出模型不代表 ChatGPT Subscription / Codex 账号有调用权限。
-  # 对选中的每一个 Responses 模型实际探测；任一失败均不写入 Provider，避免部署后才报错。
-  if [ "${CODECX_DETECTED:-false}" = "true" ]; then
-    for model_id in ${P_MODELS}; do
-      info "验证 Codex 模型可用性: ${model_id}"
-      if ! probe_codex_responses_model "${P_URL}" "${P_KEY}" "${model_id}"; then
-        info "Codex 模型 '${model_id}' 被当前账号或后端拒绝；Provider 未写入，请选择后端实际支持的模型后重试"
-        return 0
-      fi
-    done
-    ok "所选 Codex 模型均已通过 /v1/responses 实测"
-  fi
 
   P_NAME="${P_NAME}" P_URL="${P_URL}" P_KEY="${P_KEY}" P_API="${P_API}" P_MODELS="${P_MODELS}" \
     P_API_VERSION="${P_API_VERSION}" \
@@ -1294,12 +944,6 @@ print(f"[configured provider] {name}")
 PYEOF
   ok "provider '${P_NAME}' 已写入 openclaw.json（重启 Gateway 生效）"
   NEED_RESTART=true
-
-  # 若本 provider 是 Codex 后端，12.5 内已挂补丁 + 写白名单，需重启才生效。
-  # 这里仅打标记，最终由脚本完成段在前（所有配置落地后）统一重启一次。
-  if [ "${CODECX_DETECTED:-false}" = "true" ]; then
-    NEED_RESTART=true
-  fi
 }
 
 # 非交互自动配置（CI / 无 TTY / 一键脚本）：通过 CAKECLAW_PROVIDER_* 环境变量（可写在 .env）
@@ -1509,41 +1153,9 @@ else
   fi
 fi
 
-# ── 12.7 OpenCode 安装（可选）──
-# 交互式引导是否安装 OpenCode（终端 AI 编程代理，opencode.ai）。
-# 安装方式：curl -fsSL https://opencode.ai/install | bash（官方推荐）。
-# 非交互环境通过 OPENCODE_INSTALL=1 环境变量触发。
-step "12.7 OpenCode 安装"
-configure_opencode() {
-  echo ""
-  echo "  OpenCode 是开源的终端 AI 编程代理（opencode.ai），可直接在终端里与 AI 协作编码。"
-  echo "  安装后输入 opencode 进入 TUI（终端交互界面），自带模型配置引导。"
-  prompt "  是否安装 OpenCode (y/N): " DO_OC
-  case "${DO_OC}" in
-    y|Y|yes|YES)
-      info "正在安装 OpenCode（官方 curl 安装）..."
-      curl -fsSL https://opencode.ai/install | bash 2>&1 | tail -5
-      ok "OpenCode 安装完成（输入 opencode 启动）"
-      ;;
-    *) info "跳过 OpenCode 安装"; return 0 ;;
-  esac
-}
-
-# 默认交互询问；非交互环境则用 OPENCODE_INSTALL=1 环境变量触发。
-if $INTERACTIVE; then
-  configure_opencode
-else
-  if $OPENCODE_INSTALL; then
-    info "非交互环境，OPENCODE_INSTALL=1，正在安装 OpenCode..."
-    curl -fsSL https://opencode.ai/install | bash 2>&1 | tail -5
-    ok "OpenCode 安装完成"
-  else
-    info "非交互环境，且未设置 OPENCODE_INSTALL=1，跳过 OpenCode 安装"
-  fi
-fi
 
 # ── 12.8 重启生效（收尾） ──
-# 若本次安装过程中有任何需要 Gateway 重启才能生效的改动（Codex 补丁、新增 provider、Telegram 接入），
+# 若本次安装过程中有任何需要 Gateway 重启才能生效的改动（新增 provider、Telegram 接入），
 # 在此处统一执行一次 up -d 并等 healthy。可避免在中间步骤反复重启，也保证跑完即最终态。
 if $NEED_RESTART; then
   step "12.8 重启 Gateway 生效"

@@ -28,9 +28,7 @@ sudo ./scripts/install.sh --with-mihomo --with-task-engine --with-watchdog
 
 | 功能 | 启用方式 |
 |---|---|
-| Codex Responses 修复 | `--with-codex-fix` / `--with-codex-fix-b` |
 | Telegram 机器人 | 默认询问 / `.env` 自动配置 |
-| OpenCode 终端代理 | 默认询问 / `OPENCODE_INSTALL=1` |
 | mihomo TUN 代理 | `--with-mihomo` / `MIHOMO_ENABLE=1` |
 | 任务引擎 | `--with-task-engine` / `TASK_ENGINE_ENABLE=1` |
 | recovery-watchdog | `--with-watchdog` / `WATCHDOG_ENABLE=1` |

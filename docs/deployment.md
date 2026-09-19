@@ -33,7 +33,6 @@ sudo ./scripts/install.sh \
 | `--with-task-engine` | durable task 引擎 + stale 检测 |
 | `--with-watchdog` | recovery-watchdog，gateway 不健康时自动重启 |
 | `--with-sandbox` | 挂载 docker.sock，允许 gateway 管理沙箱容器 |
-| `--with-codex-fix` | Codex Responses 流式修复（方案 A） |
 
 ## 非交互部署
 
