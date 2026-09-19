@@ -55,6 +55,7 @@ sudo ./scripts/install.sh --help
 
 ## 文档
 
+- [部署设计思路](docs/deploy-design.md)
 - [部署指南](docs/deployment.md)
 - [运维手册](docs/ops.md)
 - [安全模型](docs/security.md)
