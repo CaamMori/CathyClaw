@@ -498,6 +498,48 @@ else
   ENTRYPOINT_STRIPPED=true
 fi
 
+# docker CLI 包装必须在 compose up 【之前】就位。
+#
+# 顺序依赖（与 §10.7a 的 task-engine 同类）：compose 把
+#   /data/opt/docker-cli/docker -> /usr/local/bin/docker
+# 作为 bind mount。若容器创建时该宿主路径【不存在】，Docker 会按其挂载目标
+# 的形态自动创建——这里会创建一个【目录】；而 §10.7 随后会把它重写成
+# 【文件】（包装脚本）。容器记录的挂载类型就此与宿主永久不一致，之后任何
+# 重启都直接失败：
+#   error mounting ".../docker" ... not a directory: Are you trying to mount
+#   a directory onto a file (or vice-versa)?
+# 该错误以 exit 127 退出，读起来像"命令不存在"，完全指不到真实原因；
+# 且首次开机时容器是"成功创建"的，不会触发任何启动期自愈。
+# 因此必须在 up 之前先把包装文件落位。
+install_docker_cli() {
+  mkdir -p /data/opt/docker-cli
+  local host_docker="" cand
+  for cand in "$(command -v docker 2>/dev/null)" /usr/bin/docker /usr/local/bin/docker /bin/docker; do
+    [ -n "$cand" ] || continue
+    # -f 且 -x：既要是普通文件，又要有执行权限；目录/悬空链接一律跳过
+    if [ -f "$cand" ] && [ -x "$cand" ]; then host_docker="$cand"; break; fi
+  done
+  if [ -z "$host_docker" ]; then
+    warn "未找到可执行的宿主 docker（command -v 返回的可能是目录），跳过 docker-cli 包装"
+    return 0
+  fi
+  # 幂等：历史版本可能把这两条路径误建成「目录」（cp 的经典陷阱：目标若是
+  # 目录，cp 会拷进去而不是覆盖）。-rf 同时覆盖文件与目录两种历史形态。
+  # 关键：必须是【文件】——类型错了容器就再也起不来。
+  rm -rf /data/opt/docker-cli/docker /data/opt/docker-cli/docker.real
+  cp "$host_docker" /data/opt/docker-cli/docker.real
+  # 包装脚本内部路径必须与真实安装路径一致（此前写死 /usr/local/bin/docker.real，
+  # 与实际的 /data/opt/docker-cli/docker.real 不符，沙箱内会找不到可执行文件）。
+  cat > /data/opt/docker-cli/docker <<'DOCKEREOF'
+#!/bin/sh
+# 沙箱内 docker CLI 包装：默认走宿主 docker.sock
+exec /data/opt/docker-cli/docker.real "$@"
+DOCKEREOF
+  chmod +x /data/opt/docker-cli/docker /data/opt/docker-cli/docker.real
+  ok "docker-cli 包装已就位（源: ${host_docker}）"
+}
+install_docker_cli
+
 # 生成 docker-compose.yml（持久化，避免 /tmp 被清）
 # 用 sed 替换模板中的 YOUR_* 占位符（比 envsubst 更直观，占位符即文档）。
 COMPOSE_FILE="/data/etc/openclaw/docker-compose.yml"
@@ -644,13 +686,38 @@ $WITH_MIHOMO && COMPOSE_PROFILES="${COMPOSE_PROFILES} --profile mihomo"
 #   a directory onto a file (or vice-versa)?
 # 这个错误以 exit 127 退出，读起来像"命令不存在"，完全指不到真实原因。
 #
-# 由于"容器创建时记录的挂载类型"无法从 inspect 可靠读出，
-# 采用最直接的办法：先正常 up；若输出里出现挂载类型冲突的签名，
-# 就删掉旧容器让 compose 按当前宿主类型重建一次。
+# 两道防线：
+#   A. 事前预检（精确）——读取现存容器记录的挂载列表，逐条比对宿主当前类型。
+#      Docker inspect 的 .Mounts[].Type 是 bind，但容器创建时固化的
+#      "目标是文件还是目录"体现为容器内路径是否存在且为目录。这里用
+#      docker exec 探测容器内路径类型；容器已停止时退化为读取
+#      HostConfig.Binds 中是否带 /dir 结尾等线索不可靠，
+#      因此改用最可靠的信号：宿主路径若是【目录】而容器曾把它挂到
+#      bin 目录下的同名路径，几乎必然冲突（docker-cli 是唯一此类挂载）。
+#   B. 事后自愈——up 失败且输出含挂载类型冲突签名时，删容器重建。
+# 上游修复（§6 提前安装 docker-cli 包装）已让新建机器不再产生该不一致，
+# 这里是为存量机器与用户手动改动兜底。
+#
+# A. 事前预检：若 compose 声明了「宿主文件 -> 容器 bin 路径」的挂载，
+#    而宿主侧当前是【目录】，Docker 一定是在首次 up 时把它当目录建出来的，
+#    容器记录的类型已错 → 直接删容器，让本次 up 按文件类型重建。
+COMPOSE_MOUNT_CONFLICT=false
+for bind_src in $(sed -nE 's#^ *- *(/[^:]+):/(usr/local/bin|usr/bin|bin)/[^:]+.*#\1#p' "${COMPOSE_FILE}" 2>/dev/null); do
+  if [ -d "$bind_src" ]; then
+    COMPOSE_MOUNT_CONFLICT=true
+    warn "挂载源应为文件但实为目录: ${bind_src}（Docker 首次创建时自动建立的目录）"
+  fi
+done
+if [ "$COMPOSE_MOUNT_CONFLICT" = "true" ]; then
+  warn "删除旧容器，使本次 up 按当前宿主类型重建挂载"
+  docker rm -f openclaw-gateway >/dev/null 2>&1 || true
+fi
+
 COMPOSE_LOG="$(mktemp)"
 docker compose -f "${COMPOSE_FILE}" ${COMPOSE_PROFILES} up -d >"${COMPOSE_LOG}" 2>&1 || true
 tail -3 "${COMPOSE_LOG}"
 
+# A. 事后自愈：up 输出里出现挂载类型冲突签名 → 删容器重建
 if grep -qE "not a directory|Are you trying to mount" "${COMPOSE_LOG}"; then
   warn "检测到容器挂载类型与宿主不一致，删除旧容器后重建"
   docker rm -f openclaw-gateway >/dev/null 2>&1 || true
@@ -900,31 +967,9 @@ fi
   fi
 
   # 3) docker CLI 包装（沙箱内需要 docker，但不直接暴露宿主 socket 权限）
-  # 幂等要点：这两条路径在重跑时已存在，且历史版本可能把它们误建成了「目录」
-  # （cp 的经典陷阱：目标若是目录，cp 会拷进去而不是覆盖）。因此每次先强制
-  # 清掉目标（-rf 同时覆盖文件和目录两种历史形态），再写入。
-  mkdir -p /data/opt/docker-cli
-  HOST_DOCKER=""
-  for cand in "$(command -v docker 2>/dev/null)" /usr/bin/docker /usr/local/bin/docker /bin/docker; do
-    [ -n "$cand" ] || continue
-    # -f 且 -x：既要是普通文件，又要有执行权限；目录/悬空链接一律跳过
-    if [ -f "$cand" ] && [ -x "$cand" ]; then HOST_DOCKER="$cand"; break; fi
-  done
-  if [ -n "$HOST_DOCKER" ]; then
-    rm -rf /data/opt/docker-cli/docker.real /data/opt/docker-cli/docker
-    cp "$HOST_DOCKER" /data/opt/docker-cli/docker.real
-    # 包装脚本内部路径必须与真实安装路径一致（此前写死 /usr/local/bin/docker.real，
-    # 与实际的 /data/opt/docker-cli/docker.real 不符，沙箱内会找不到可执行文件）。
-    cat > /data/opt/docker-cli/docker <<'DOCKEREOF'
-#!/bin/sh
-# 沙箱内 docker CLI 包装：默认走宿主 docker.sock
-exec /data/opt/docker-cli/docker.real "$@"
-DOCKEREOF
-    chmod +x /data/opt/docker-cli/docker /data/opt/docker-cli/docker.real
-    ok "docker-cli 包装安装到 /data/opt/docker-cli（源: ${HOST_DOCKER}）"
-  else
-    warn "未找到可执行的宿主 docker（command -v 返回的可能是目录），跳过 docker-cli 包装"
-  fi
+  # 已在 §6 compose up 【之前】安装（顺序依赖，见那里注释）；此处幂等刷新，
+  # 保证重跑/升级后拿到最新逻辑，同时确保路径类型是【文件】而非目录。
+  install_docker_cli
 }
 
 # mihomo 配置（渲染到生产机真实路径 /usr/local/etc/mihomo/config.yaml）
