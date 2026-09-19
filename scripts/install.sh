@@ -1004,11 +1004,24 @@ cat > /etc/cron.d/openclaw-ops << 'CRONEOF'
 17 4 * * * root /usr/local/bin/nightly-backup.sh
 # 环境快照
 30 4 * * * root /usr/local/bin/gen-env-snapshot.sh
+CRONEOF
+
+# 任务引擎相关的两条排期只在启用 task-engine 时写入。
+# 否则它们指向 /data/state/workspace/task-engine/ 下并不存在的脚本，
+# cron 会每轮都记一条 "No such file or directory"，把真正的告警淹掉。
+if $WITH_TASK_ENGINE; then
+  cat >> /etc/cron.d/openclaw-ops << 'CRONEOF_TE'
 # 任务停滞看门狗（24h+ 去重告警）
 17 */6 * * * root cd /data/state/workspace/task-engine && ./stale_alert.sh
+# 完成声明审计（扫描"宣称完成但无 A 级证据"的消息，去重后告警）
+43 7 * * * root /data/state/workspace/task-engine/claim_audit_cron.sh
+CRONEOF_TE
+fi
+
+cat >> /etc/cron.d/openclaw-ops << 'CRONEOF_TAIL'
 # 沙箱 bind mount 源路径自愈（gateway 用容器内视角路径做 Source 会指向错误目录）
 */5 * * * * root /usr/local/bin/ensure-sandbox-paths.sh >/dev/null 2>&1
-CRONEOF
+CRONEOF_TAIL
 chmod 644 /etc/cron.d/openclaw-ops
 ok "运维 cron 矩阵就位（/etc/cron.d/openclaw-ops）"
 

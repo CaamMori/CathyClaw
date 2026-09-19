@@ -4,6 +4,13 @@ import argparse, fcntl, json, os, shlex, shutil, signal, subprocess, sys, time, 
 from pathlib import Path
 ROOT = Path(os.environ.get("TASK_ENGINE_HOME", Path(__file__).resolve().parent))
 BASE = ROOT / "tasks"
+# 任务脚本持久目录：凡任务用到的运行/验收脚本**必须**落在这里。
+# 反例（2026-09-19 事故）：某任务 run_argv 指向 /tmp/n.sh，/tmp 被清理后
+# 验收命令永久失效，任务卡在 awaiting_verification 6.18 天。
+SCRIPTS = ROOT / "scripts"
+
+# 易失路径前缀：落在这些位置的脚本会在重启/清理后消失
+VOLATILE_PREFIXES = ("/tmp/", "/var/tmp/", "/dev/shm/", "/run/")
 
 HEARTBEAT_STALE = float(os.environ.get("TE_HEARTBEAT_STALE", "45"))
 def now(): return time.time()
@@ -11,6 +18,33 @@ def valid_id(value):
     if not value or not value.isidentifier() or value in (".", "..") or "/" in value or "\\" in value:
         raise ValueError("invalid task id")
     return value
+
+# ── root 运行防护（2026-09-19 事故后加）────────────────────────────────
+# 事故：运维侧以 root 直接跑本脚本，atomic_write 建出的 task.json 属主变成
+#   root:root 且权限 600 → 容器内的 node(uid 1000) 读不到 →
+#   taskboard.py --summary 抛 PermissionError，巡检整体失败。
+# 根因同 §B9.10「root 污染」一脉：**宿主 root 身份写的文件，容器内消费方读不到**。
+OWNER_UID = 1000
+
+def _check_owner():
+    """非 1000 身份运行、且目标目录已属 1000 时拒绝（防属主污染）。"""
+    if os.environ.get("TE_ALLOW_ROOT") == "1":
+        return
+    try:
+        st = ROOT.stat()
+    except OSError:
+        return
+    if st.st_uid == OWNER_UID and os.geteuid() != OWNER_UID:
+        raise SystemExit(
+            "\n[拒绝执行] 目标目录属主是 %d:%d，但当前以 uid=%d 运行。\n"
+            "  以 root 运行会把新建的 task.json 写成 root:root(600)，\n"
+            "  导致容器内 node 用户无法读取、taskboard 巡检报 PermissionError。\n"
+            "  正确用法：docker exec -u node openclaw-gateway python3 "
+            "/home/node/.openclaw/workspace/task-engine/taskctl.py ...\n"
+            "  或：  sudo -u '#1000' python3 %s ...\n"
+            "  （确需放行：TE_ALLOW_ROOT=1）"
+            % (OWNER_UID, OWNER_UID, os.geteuid(), __file__))
+
 
 def atomic_write(path, data):
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -36,6 +70,27 @@ def load(tid):
     with path.open(encoding="utf-8") as f: return path, json.load(f)
 def save(path, data): data["updated_at"] = now(); atomic_write(path, data)
 
+def check_volatile_argv(argv, where):
+    """检查 argv 是否引用了易失路径，是则抛出可读错误。
+
+    设计意图：把"脚本放 /tmp"这个错误**挡在创建时**，而不是等到几天后
+    验收失败才暴露——那时脚本早没了，且失败态曾不可逆（§B9.15.1）。
+    """
+    if not argv:
+        return
+    for tok in argv:
+        if not isinstance(tok, str):
+            continue
+        for pre in VOLATILE_PREFIXES:
+            if tok.startswith(pre):
+                raise ValueError(
+                    f"[{where}] 脚本路径 {tok!r} 落在易失目录 {pre!r}。\n"
+                    f"  该目录会在重启/清理后消失，导致任务无法重跑或验收失败。\n"
+                    f"  请改用持久目录，例如：{SCRIPTS}/<task-id>-<名称>.sh\n"
+                    f"  （可先 mkdir -p {SCRIPTS} 并 chown 1000:1000）"
+                )
+
+
 def open_lock(path):
     fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
     os.chmod(path, 0o600)
@@ -57,7 +112,9 @@ def create(args):
     cmd = getattr(args, "accept_cmd", None)
     if cmd:
         # create 时登记的验收命令：后续 verify 无需再猜"该怎么验收"
-        task["acceptance_argv"] = shlex.split(cmd)
+        accept_argv = shlex.split(cmd)
+        check_volatile_argv(accept_argv, "create --accept-cmd")
+        task["acceptance_argv"] = accept_argv
     atomic_write(path, task)
     print(tid)
     if not cmd:
@@ -184,6 +241,7 @@ def normalize_timeout_argv(args, accept_flags=()):
 def run_task(args):
     normalize_timeout_argv(args)
     if not args.argv: raise ValueError("explicit argv required")
+    check_volatile_argv(args.argv, "run")
     path, _ = load(args.id); lock_path = path.parent / "run.lock"
     with open_lock(lock_path) as lock:
         try: fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -378,6 +436,8 @@ def reset(args):
 
 def verify(args):
     normalize_timeout_argv(args, accept_flags=("--accept",))
+    if args.argv:
+        check_volatile_argv(args.argv, "verify")
     path, _ = load(args.id)
     with open_lock(path.parent / "run.lock") as lock:
         try: fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -411,7 +471,70 @@ def verify(args):
                   f"or `--accept` if a human already approved", file=sys.stderr)
         return 0 if ok else 1
 
+def migrate_volatile(args, tasks=None):
+    """把历史任务里指向易失路径的 argv **标记**出来（不改写、不伪造）。
+
+    为什么是"标记"而不是"重写路径"：
+      原脚本（如 /tmp/n.sh）已经不存在，任何"改写成一个新路径"都是**伪造**——
+      新路径下并没有那个脚本。诚实的做法是：
+        · 记录 volatile_paths（原始路径，留痕）
+        · 记录 migrated_at / migrate_note
+        · 若任务因此**永远无法重跑/重验**，把它标为需要人工决策
+      这与本项目"不许编造"的铁律一致（§A5.1 铁律 27）。
+    """
+    scanned = flagged = 0
+    for taskdir in sorted(BASE.iterdir()) if BASE.is_dir() else []:
+        if not taskdir.is_dir() or taskdir.is_symlink():
+            continue
+        tj = taskdir / "task.json"
+        if not tj.is_file():
+            continue
+        if tasks and taskdir.name not in tasks:
+            continue
+        scanned += 1
+        try:
+            with tj.open(encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            continue
+        hits = []
+        for field in ("run_argv", "verification_argv", "acceptance_argv"):
+            argv = data.get(field) or []
+            if not isinstance(argv, list):
+                continue
+            for tok in argv:
+                if isinstance(tok, str):
+                    for pre in VOLATILE_PREFIXES:
+                        if tok.startswith(pre):
+                            hits.append({"field": field, "path": tok})
+                            break
+        if not hits:
+            continue
+        flagged += 1
+        # 已存在且内容相同则不重复写（幂等）
+        if data.get("volatile_paths") == hits:
+            if not args.quiet:
+                print(f"  [=] {taskdir.name}: 已标记（{len(hits)} 处）")
+            continue
+        data["volatile_paths"] = hits
+        data["migrated_at"] = now()
+        data["migrate_note"] = (
+            "argv 指向易失目录（脚本已不存在）。脚本被清理后本任务无法重跑/重验；"
+            "如需重跑，请把脚本放到 scripts/ 下并更新 argv，或直接 delete 本任务（已 completed 可保留留痕）。"
+        )
+        # 已完成且已验收的任务：只留痕，不改状态（改状态会造成"任务回退"的假象）
+        if not args.quiet:
+            print(f"  [!] {taskdir.name}: 标记 {len(hits)} 处易失路径 "
+                  f"({', '.join(h['path'] for h in hits)})")
+        atomic_write(tj, data)
+
+    print(f"\n扫描 {scanned} 个任务，标记 {flagged} 个含易失路径的任务")
+    print(f"  易失前缀: {', '.join(VOLATILE_PREFIXES)}")
+    print(f"  持久脚本目录: {SCRIPTS}")
+
+
 def main(argv=None):
+    _check_owner()
     argv = sys.argv[1:] if argv is None else argv
     if argv and argv[0] == "__worker":
         if len(argv) < 5 or argv[3] != "--": raise ValueError("bad worker invocation")
@@ -422,6 +545,7 @@ def main(argv=None):
     p=sub.add_parser("status"); p.add_argument("id"); p.set_defaults(func=status)
     p=sub.add_parser("delete"); p.add_argument("id"); p.set_defaults(func=delete_task)
     p=sub.add_parser("reset"); p.add_argument("id"); p.add_argument("--force",action="store_true"); p.add_argument("--reason"); p.set_defaults(func=reset)
+    p=sub.add_parser("migrate-volatile"); p.add_argument("--quiet",action="store_true",help="只报标记数，不逐条打印"); p.set_defaults(func=migrate_volatile)
     p=sub.add_parser("reap"); p.add_argument("id", nargs="?"); p.add_argument("--dry-run",action="store_true"); p.set_defaults(func=reap)
     p=sub.add_parser("run"); p.add_argument("id"); p.add_argument("--timeout",type=float,default=30); p.add_argument("--force",action="store_true"); p.add_argument("argv",nargs=argparse.REMAINDER); p.set_defaults(func=run_task)
     p=sub.add_parser("verify"); p.add_argument("id"); p.add_argument("--timeout",type=float,default=30); p.add_argument("--accept",action="store_true",help="人工裁决直接通过，跳过验收命令执行"); p.add_argument("argv",nargs=argparse.REMAINDER); p.set_defaults(func=verify)

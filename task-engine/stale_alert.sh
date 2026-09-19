@@ -12,7 +12,7 @@ set -u
 TE_DIR="/data/state/workspace/task-engine"
 STATE="$TE_DIR/.stale_alert_state.json"
 GW="openclaw-gateway"
-TARGET="${TE_ALERT_TARGET:-YOUR_TELEGRAM_USER_ID}"
+TARGET="${TE_ALERT_TARGET:-}"
 DEDUPE_HOURS="${STALE_DEDUPE_HOURS:-24}"
 
 export TASK_ENGINE_HOME="$TE_DIR"

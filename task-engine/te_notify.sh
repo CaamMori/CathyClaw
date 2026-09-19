@@ -16,7 +16,7 @@ for d in $TE_CANDIDATES; do
 done
 [ -z "$TE_DIR" ] && { echo "找不到 task-engine 目录" >&2; exit 1; }
 export TASK_ENGINE_HOME="${TASK_ENGINE_HOME:-$TE_DIR}"
-TARGET="${TE_ALERT_TARGET:-YOUR_TELEGRAM_USER_ID}"
+TARGET="${TE_ALERT_TARGET:-}"
 GW="openclaw-gateway"
 
 id="${1:-}"
