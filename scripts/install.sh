@@ -634,6 +634,34 @@ PYEOF_TGDIS
 
 COMPOSE_PROFILES=""
 $WITH_MIHOMO && COMPOSE_PROFILES="${COMPOSE_PROFILES} --profile mihomo"
+
+# 启动前先校验既有容器的 bind mount 类型是否仍然成立。
+# Docker 在创建容器时会把挂载点的类型（文件 vs 目录）固化下来；若宿主侧路径类型变了
+# （典型场景：早期版本把 /data/opt/docker-cli/docker 误建成了目录，后续修复成文件），
+# 复用旧容器会直接启动失败：
+#   error mounting ".../docker" ... not a directory: Are you trying to mount
+#   a directory onto a file (or vice-versa)?
+# 这里主动探测一次，发现类型不符就删掉旧容器让 compose 重建，
+# 而不是让用户面对一个看不懂的 OCI runtime 错误。
+if docker inspect openclaw-gateway >/dev/null 2>&1; then
+  MOUNT_MISMATCH=false
+  while IFS='|' read -r SRC DST; do
+    [ -n "$SRC" ] && [ -n "$DST" ] || continue
+    # 宿主路径存在但不是普通文件/目录时跳过；只比对「存在且类型明确」的情况
+    if [ -f "$SRC" ] && [ -d "$DST" ] && ! [ -f "$DST" ]; then
+      MOUNT_MISMATCH=true; break
+    fi
+    if [ -d "$SRC" ] && [ -f "$DST" ]; then
+      MOUNT_MISMATCH=true; break
+    fi
+  done < <(docker inspect openclaw-gateway \
+             --format '{{range .Mounts}}{{.Source}}|{{.Destination}}{{println}}{{end}}' 2>/dev/null)
+  if $MOUNT_MISMATCH; then
+    warn "检测到既有容器的挂载点类型与宿主不一致，删除旧容器以便重建"
+    docker rm -f openclaw-gateway >/dev/null 2>&1 || true
+  fi
+fi
+
 docker compose -f "${COMPOSE_FILE}" ${COMPOSE_PROFILES} up -d 2>&1 || fail "Gateway 启动失败"
 
 # 若后续还有需要 Gateway 重启才能生效的改动（如新增 provider、Telegram 接入），
