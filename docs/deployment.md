@@ -23,7 +23,6 @@ sudo ./scripts/install.sh
 sudo ./scripts/install.sh \
   --with-mihomo \
   --with-task-engine \
-  --with-watchdog \
   --with-sandbox
 ```
 
@@ -31,7 +30,6 @@ sudo ./scripts/install.sh \
 |---|---|
 | `--with-mihomo` | mihomo TUN sidecar，为 gateway 提供出海代理 |
 | `--with-task-engine` | durable task 引擎 + stale 检测 |
-| `--with-watchdog` | recovery-watchdog，gateway 不健康时自动重启 |
 | `--with-sandbox` | 挂载 docker.sock，允许 gateway 管理沙箱容器 |
 
 ## 非交互部署

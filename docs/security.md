@@ -5,7 +5,7 @@
 ### 机制层（Docker / 系统强制）
 - Gateway 仅监听 `127.0.0.1:18789`，不直接暴露公网
 - Nginx 作为唯一外部入口；默认 `limit_conn` 限制每 IP 并发连接（`CONN_LIMIT`，默认 15）
-- 容器非 root（`node`），不挂载 docker.sock，非 host network
+- 容器非 root（`node`）；默认不挂载 docker.sock，启用 `--with-sandbox` 时经 `group_add`(docker gid) 最小授权
 - cgroup 限制：memory / cpu / pids（默认 PID 上限 1024）
 - 密钥经 `env_file` 注入，`runtime.env` 权限 0600
 

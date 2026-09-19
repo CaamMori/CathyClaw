@@ -1,11 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 # ============================================================
-# cakeclaw 一键部署脚本
+# OpenClaw 一键部署脚本
 # 适用: Ubuntu 24.04 LTS / Debian 12+ (x86_64, 最小 2C/4G/20G)
-# 用法: sudo ./scripts/install.sh [--no-phase2] [--no-phase3]
-#   --no-phase2  跳过 watchdog/trends/cert-check cron
-#   --no-phase3  跳过 audit/kbase cron
+# 用法: sudo ./scripts/install.sh [--with-mihomo] [--with-task-engine] [--with-sandbox]
 # ============================================================
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -66,7 +64,7 @@ wait_gateway_ready() {
   local HS
   for i in $(seq 1 36); do
     sleep 5
-    HS=$(docker inspect --format '{{.State.Health.Status}}' cakeclaw-gateway 2>/dev/null || echo "no-health")
+    HS=$(docker inspect --format '{{.State.Health.Status}}' openclaw-gateway 2>/dev/null || echo "no-health")
     case "${HS}" in
       healthy)
         ok "Gateway 已就绪 (healthy, ${i}x5s)"
@@ -74,49 +72,41 @@ wait_gateway_ready() {
         break
         ;;
       unhealthy)
-        docker logs cakeclaw-gateway --tail 30 2>&1
+        docker logs openclaw-gateway --tail 30 2>&1
         fail "Gateway 健康检查失败 (unhealthy)"
         ;;
       starting|no-health) : ;;
       *)
-        docker logs cakeclaw-gateway --tail 30 2>&1
+        docker logs openclaw-gateway --tail 30 2>&1
         fail "Gateway 状态异常: ${HS}"
         ;;
     esac
   done
   if [ "${READY}" != true ]; then
-    docker logs cakeclaw-gateway --tail 30 2>&1
+    docker logs openclaw-gateway --tail 30 2>&1
     fail "Gateway 未在 180s 内变为 healthy"
   fi
 }
 
 # ── 0. 参数解析 ──
-PHASE2=true; PHASE3=true
 HELP=false
 NEED_RESTART=false
 WITH_MIHOMO=false
 WITH_TASK_ENGINE=false
-WITH_WATCHDOG=false
 WITH_SANDBOX=false
 for arg in "$@"; do
   case "$arg" in
-    --no-phase2) PHASE2=false ;;
-    --no-phase3) PHASE3=false ;;
     --with-mihomo) WITH_MIHOMO=true ;;
     --with-task-engine) WITH_TASK_ENGINE=true ;;
-    --with-watchdog) WITH_WATCHDOG=true ;;
     --with-sandbox) WITH_SANDBOX=true ;;
     --help|-h)   HELP=true ;;
-    *) fail "未知参数: $arg。支持的参数: --no-phase2 --no-phase3 --with-mihomo --with-task-engine --with-watchdog --with-sandbox --help" ;;
+    *) fail "未知参数: $arg。支持的参数: --with-mihomo --with-task-engine --with-sandbox --help" ;;
   esac
 done
 if $HELP; then
   echo "用法: sudo ./scripts/install.sh [选项]"
-  echo "  --no-phase2         跳过自愈/监控"
-  echo "  --no-phase3         跳过审计"
   echo "  --with-mihomo       启用 mihomo TUN 代理 sidecar"
   echo "  --with-task-engine  启用任务引擎（taskctl + taskboard + stale guard）"
-  echo "  --with-watchdog     启用 recovery-watchdog 容器"
   echo "  --with-sandbox      启用 docker.sock 挂载（用于 OpenClaw 沙箱）"
   echo "  --help              显示此帮助"
   exit 0
@@ -152,7 +142,6 @@ MIHOMO_IMAGE="${MIHOMO_IMAGE:-metacubex/mihomo:latest}"
 DOCKER_GROUP_ID="${DOCKER_GROUP_ID:-999}"
 [ "${MIHOMO_ENABLE:-}" = "1" ] && WITH_MIHOMO=true
 [ "${TASK_ENGINE_ENABLE:-}" = "1" ] && WITH_TASK_ENGINE=true
-[ "${WATCHDOG_ENABLE:-}" = "1" ] && WITH_WATCHDOG=true
 [ "${SANDBOX_ENABLE:-}" = "1" ] && WITH_SANDBOX=true
 # 交互安装时让用户直接提供域名；该值同时用于 Nginx、Let's Encrypt 与 Control UI 来源白名单。
 # 非交互环境继续只从 .env / DOMAIN 环境变量读取，避免 CI 卡在输入提示。
@@ -312,7 +301,7 @@ fi
 # 基础工具
 apt-get install -y curl wget >/dev/null 2>&1
 
-# logrotate：日志轮转（/data/logs/*.log 会随 watchdog/audit 持续增长，不轮转会无限膨胀）
+# logrotate：日志轮转（运维矩阵与网关日志会让 /data/logs/*.log 持续增长）
 if ! command -v logrotate >/dev/null 2>&1; then
   apt-get install -y logrotate >/dev/null 2>&1 || info "logrotate 安装失败（跳过，日志可能无限增长）"
 fi
@@ -325,11 +314,8 @@ mkdir -p /data/state/workspace
 for d in /data/backups/openclaw-state /data/backups/nightly /data/logs /data/scripts /data/etc/openclaw /data/etc/mihomo /data/var/lib/openclaw; do
   mkdir -p "$d"
 done
-for d in /data/knowledge/{runbooks,playbooks,templates,changelog,architecture}; do
-  mkdir -p "$d"
-done
 chmod 700 /data/backups /data/state /data/etc/openclaw /data/var/lib/openclaw
-chmod 755 /data/state/workspace /data/logs /data/scripts /data/knowledge
+chmod 755 /data/state/workspace /data/logs /data/scripts
 # Gateway 以 UID/GID 1000（node）运行；Telegram Token 专用目录只对该用户开放，
 # Compose 仅挂载该目录，不暴露同级的 runtime.env。
 install -d -o 1000 -g 1000 -m 700 "${TELEGRAM_TOKEN_DIR}"
@@ -444,7 +430,6 @@ fi
 
 COMPOSE_PROFILES=""
 $WITH_MIHOMO && COMPOSE_PROFILES="${COMPOSE_PROFILES} --profile mihomo"
-$WITH_WATCHDOG && COMPOSE_PROFILES="${COMPOSE_PROFILES} --profile watchdog"
 docker compose -f "${COMPOSE_FILE}" ${COMPOSE_PROFILES} up -d 2>&1 || fail "Gateway 启动失败"
 
 # 若后续还有需要 Gateway 重启才能生效的改动（如新增 provider、Telegram 接入），
@@ -459,13 +444,13 @@ fi
 step "7. Nginx"
 # 幂等：仅在 nginx 站点配置不存在时写入（首装）。已存在则保留用户手改的追加配置，
 # 重跑 install.sh 不覆盖，但会重新检测默认站点并 reload（不应覆盖用户自定义 server 块）。
-if [ ! -f /etc/nginx/sites-available/cakeclaw ]; then
+if [ ! -f /etc/nginx/sites-available/openclaw ]; then
 if [ -n "$DOMAIN" ]; then
   # 先只启用 HTTP：让 ACME HTTP-01 challenge 能通过，避免引用尚不存在的证书。
   sudo mkdir -p /var/www/certbot
-  cat > /etc/nginx/sites-available/cakeclaw << NGINX
+  cat > /etc/nginx/sites-available/openclaw << NGINX
 map \$http_upgrade \$connection_upgrade { default upgrade; '' close; }
-limit_conn_zone \$binary_remote_addr zone=cakeclaw_limit:10m;
+limit_conn_zone \$binary_remote_addr zone=openclaw_limit:10m;
 server {
   listen 80; server_name ${DOMAIN};
   location ^~ /.well-known/acme-challenge/ { root /var/www/certbot; }
@@ -478,19 +463,19 @@ server {
     proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
     proxy_set_header X-Forwarded-Proto \$scheme;
     proxy_read_timeout 86400;
-    limit_conn cakeclaw_limit ${CONN_LIMIT};
+    limit_conn openclaw_limit ${CONN_LIMIT};
   }
 }
 NGINX
-  ln -sf /etc/nginx/sites-available/cakeclaw /etc/nginx/sites-enabled/cakeclaw
+  ln -sf /etc/nginx/sites-available/openclaw /etc/nginx/sites-enabled/openclaw
   rm -f /etc/nginx/sites-enabled/default
   nginx -t || fail "HTTP Nginx 配置校验失败"
   systemctl reload nginx
 
   if certbot certonly --webroot -w /var/www/certbot -d "${DOMAIN}" --non-interactive --agree-tos -m "admin@${DOMAIN}"; then
-    cat > /etc/nginx/sites-available/cakeclaw << NGINX
+    cat > /etc/nginx/sites-available/openclaw << NGINX
 map \$http_upgrade \$connection_upgrade { default upgrade; '' close; }
-limit_conn_zone \$binary_remote_addr zone=cakeclaw_limit:10m;
+limit_conn_zone \$binary_remote_addr zone=openclaw_limit:10m;
 server {
   listen 80; server_name ${DOMAIN};
   location ^~ /.well-known/acme-challenge/ { root /var/www/certbot; }
@@ -510,7 +495,7 @@ server {
     proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
     proxy_set_header X-Forwarded-Proto \$scheme;
     proxy_read_timeout 86400;
-    limit_conn cakeclaw_limit ${CONN_LIMIT};
+    limit_conn openclaw_limit ${CONN_LIMIT};
   }
 }
 NGINX
@@ -522,7 +507,7 @@ NGINX
   fi
 else
   # 无域名：只用 8080
-  cat > /etc/nginx/sites-available/cakeclaw << NGINX
+  cat > /etc/nginx/sites-available/openclaw << NGINX
 map \$http_upgrade \$connection_upgrade { default upgrade; '' close; }
 server {
   listen 8080;
@@ -537,14 +522,14 @@ server {
   }
 }
 NGINX
-  ln -sf /etc/nginx/sites-available/cakeclaw /etc/nginx/sites-enabled/cakeclaw
+  ln -sf /etc/nginx/sites-available/openclaw /etc/nginx/sites-enabled/openclaw
   rm -f /etc/nginx/sites-enabled/default
   nginx -t && systemctl reload nginx
   ok "Nginx (8080, 无 HTTPS) 就位"
 fi
 else
   # nginx 配置已存在：保留用户自定义，仅确保软链与 reload 到位，不覆盖内容
-  ln -sf /etc/nginx/sites-available/cakeclaw /etc/nginx/sites-enabled/cakeclaw 2>/dev/null || true
+  ln -sf /etc/nginx/sites-available/openclaw /etc/nginx/sites-enabled/openclaw 2>/dev/null || true
   nginx -t && systemctl reload nginx 2>/dev/null || true
   ok "Nginx 配置已存在，跳过覆盖（保留用户配置）"
 fi
@@ -614,50 +599,19 @@ ok "策略文件已写入"
 
 # ── 9. 备份 ──
 step "9. 备份"
-cp "$PROJECT_DIR/scripts/backup.sh" /data/scripts/backup.sh 2>/dev/null || true
-chmod 700 /data/scripts/backup.sh
-bash /data/scripts/backup.sh
-# 每天 2:00 自动备份。cron 环境不 source .env，因此用 env 前缀显式传 retention，
-# 否则自定义的 BACKUP_RETENTION_DAYS 永远回退到 backup.sh 里的默认值 7。
-# 用 /etc/cron.d/ 独立文件：天然幂等（重写同名文件即可）、可 git 版本化、不污染 root crontab。
-cat > /etc/cron.d/cakeclaw-backup << CRONEOF
-# cakeclaw 自动备份（每天 2:00）
-0 2 * * * root BACKUP_RETENTION_DAYS=${BACKUP_RETENTION_DAYS} /data/scripts/backup.sh >> /data/logs/backup.log 2>&1
-CRONEOF
-chmod 644 /etc/cron.d/cakeclaw-backup
-ok "备份就绪（cron.d: 每天 2:00）"
+# 备份统一由运维矩阵的 nightly-backup.sh 承担（见 10.7 安装 + /etc/cron.d/openclaw-ops 排期），
+# 保留 7 天，落盘 /data/backups/nightly/。
+ok "备份策略：nightly-backup.sh（由运维矩阵排期）"
 
-# ── 10. 健康巡检 ──
-step "10. 巡检 Cron"
-cat > /data/scripts/health-check.sh << 'HC'
-#!/usr/bin/env bash
-set -euo pipefail
-OUT="/data/logs/health-check"
-mkdir -p "${OUT}"
-TS="$(date -u +%Y%m%dT%H%M%SZ)"
-R="${OUT}/${TS}.json"
-DISK_PCT=$(df -P / | awk 'NR==2{gsub("%","",$5); print $5}')
-MEM_FREE=$(free -g | awk '/Mem:/{print $7}')
-SWAP_TOTAL=$(free -g | awk '/Swap:/{print $2}')
-GW_STATUS=$(docker ps --filter name=cakeclaw-gateway --format '{{.Status}}' 2>/dev/null || echo not-running)
-NGX_CHECK=ok; nginx -t >/dev/null 2>&1 || NGX_CHECK=fail
-printf '{"ts":"%s","disk_pct":%s,"mem_free_gb":%s,"swap_gb":%s,"gateway":"%s","nginx":"%s"}\n' "$TS" "$DISK_PCT" "$MEM_FREE" "$SWAP_TOTAL" "$GW_STATUS" "$NGX_CHECK" > "${R}"
-echo "[$(date +%H:%M)] disk=${DISK_PCT}% mem=${MEM_FREE}G gw=${GW_STATUS} nginx=${NGX_CHECK}"
-HC
-chmod 700 /data/scripts/health-check.sh
-/data/scripts/health-check.sh
-cat > /etc/cron.d/cakeclaw-health-check << 'CRONEOF'
-# cakeclaw 健康巡检（每天 3:00）
-0 3 * * * root /data/scripts/health-check.sh >> /data/logs/health-check/cron.log 2>&1
-CRONEOF
-chmod 644 /etc/cron.d/cakeclaw-health-check
-ok "巡检 cron 就位（cron.d）"
+# ── 10. 巡检与日志轮转 ──
+step "10. 巡检与日志轮转"
+# 巡检由运维矩阵的 selfcheck.py（每 10 分钟快检，异常推 Telegram）承担，见 10.7。
 
-# 日志轮转：watchdog(每5分钟)/audit(每小时)/health-check(每天) 会让 /data/logs/*.log 无限增长，
+# 日志轮转：运维矩阵与网关日志会让 /data/logs/*.log 持续增长，
 # 用 logrotate 以大小+保留份数控制，避免磁盘被日志吃满。
 if command -v logrotate >/dev/null 2>&1; then
-  cat > /etc/logrotate.d/cakeclaw << 'LR'
-/data/logs/*.log /data/logs/health-check/*.log {
+  cat > /etc/logrotate.d/openclaw << 'LR'
+/data/logs/*.log {
     daily
     rotate 7
     size 50M
@@ -668,56 +622,13 @@ if command -v logrotate >/dev/null 2>&1; then
     delaycompress
 }
 LR
-  ok "logrotate 已配置（/etc/logrotate.d/cakeclaw）"
+  ok "logrotate 已配置（/etc/logrotate.d/openclaw）"
 else
   info "logrotate 不存在，跳过日志轮转配置"
 fi
 
-# ── 10.5 Phase 2: watchdog + trends ──
-if $PHASE2; then
-  step "10.5 Phase 2: 自愈 + 周报"
-  cp "$PROJECT_DIR/scripts/watchdog.sh" /data/scripts/watchdog.sh 2>/dev/null || true
-  cp "$PROJECT_DIR/scripts/alert.sh" /data/scripts/alert.sh 2>/dev/null || true
-  cp "$PROJECT_DIR/scripts/trends.sh" /data/scripts/trends.sh 2>/dev/null || true
-  cp "$PROJECT_DIR/scripts/cert-check.sh" /data/scripts/cert-check.sh 2>/dev/null || true
-  chmod 700 /data/scripts/watchdog.sh /data/scripts/alert.sh /data/scripts/trends.sh /data/scripts/cert-check.sh
-  cat > /etc/cron.d/cakeclaw-watchdog << 'CRONEOF'
-# cakeclaw 自愈（每 5 分钟）
-*/5 * * * * root /data/scripts/watchdog.sh >> /data/logs/watchdog.log 2>&1
-CRONEOF
-  cat > /etc/cron.d/cakeclaw-trends << 'CRONEOF'
-# cakeclaw 周报（每周一 9:00）
-0 9 * * 1 root /data/scripts/trends.sh >> /data/logs/trends.log 2>&1
-CRONEOF
-  cat > /etc/cron.d/cakeclaw-cert-check << CRONEOF
-# cakeclaw 证书到期提醒（每天 9:00）
-0 9 * * * root /data/scripts/cert-check.sh ${DOMAIN} >> /data/logs/cert-check.log 2>&1
-CRONEOF
-  chmod 644 /etc/cron.d/cakeclaw-watchdog /etc/cron.d/cakeclaw-trends /etc/cron.d/cakeclaw-cert-check
-  ok "watchdog + trends + cert-check cron 就位（cron.d）"
-else
-  info "跳过 Phase 2 (--no-phase2)"
-fi
-
-# ── 10.6 Phase 3: audit + kbase ──
-if $PHASE3; then
-  step "10.6 Phase 3: 审计"
-  cp "$PROJECT_DIR/scripts/audit.sh" /data/scripts/audit.sh 2>/dev/null || true
-  cp "$PROJECT_DIR/scripts/changelog.sh" /data/scripts/changelog.sh 2>/dev/null || true
-  cp "$PROJECT_DIR/scripts/kbase.sh" /data/scripts/kbase.sh 2>/dev/null || true
-  chmod 700 /data/scripts/audit.sh /data/scripts/changelog.sh /data/scripts/kbase.sh
-  cat > /etc/cron.d/cakeclaw-audit << 'CRONEOF'
-# cakeclaw 审计（每小时）
-0 * * * * root /data/scripts/audit.sh >> /data/logs/audit.log 2>&1
-CRONEOF
-  chmod 644 /etc/cron.d/cakeclaw-audit
-  ok "audit + changelog cron 就位（cron.d）"
-else
-  info "跳过 Phase 3 (--no-phase3)"
-fi
-
-# ── 10.7 运维/自愈组件（可选）──
-if $WITH_MIHOMO || $WITH_WATCHDOG || $WITH_TASK_ENGINE; then
+# ── 10.7 运维/自愈组件 ──
+{
   step "10.7 安装运维/自愈组件"
   mkdir -p /data/scripts /usr/local/bin /var/lib/openclaw /data/opt
 
@@ -749,7 +660,7 @@ DOCKEREOF
   else
     warn "未找到宿主 docker，跳过 docker-cli 包装"
   fi
-fi
+}
 
 # mihomo 配置（渲染到生产机真实路径 /usr/local/etc/mihomo/config.yaml）
 if $WITH_MIHOMO; then
@@ -773,9 +684,8 @@ if $WITH_MIHOMO; then
   fi
 fi
 
-# 统一 cron 矩阵（cron.d/openclaw-ops），仅在启用运维组件时写入
-if $WITH_MIHOMO || $WITH_WATCHDOG || $WITH_TASK_ENGINE; then
-  cat > /etc/cron.d/openclaw-ops << 'CRONEOF'
+# 统一 cron 矩阵（cron.d/openclaw-ops），无条件写入（重跑即覆盖）
+cat > /etc/cron.d/openclaw-ops << 'CRONEOF'
 # OpenClaw 运维矩阵 — 由安装脚本生成，重跑即覆盖
 # 沙箱重启策略钉死 unless-stopped
 */2 * * * * root /usr/local/bin/pin-sbx-restart.sh
@@ -800,9 +710,8 @@ if $WITH_MIHOMO || $WITH_WATCHDOG || $WITH_TASK_ENGINE; then
 # 任务停滞看门狗（24h+ 去重告警）
 17 */6 * * * root cd /data/state/workspace/task-engine && ./stale_alert.sh
 CRONEOF
-  chmod 644 /etc/cron.d/openclaw-ops
-  ok "运维 cron 矩阵就位（/etc/cron.d/openclaw-ops）"
-fi
+chmod 644 /etc/cron.d/openclaw-ops
+ok "运维 cron 矩阵就位（/etc/cron.d/openclaw-ops）"
 
 if $WITH_TASK_ENGINE; then
   mkdir -p /data/state/workspace/task-engine
@@ -814,20 +723,14 @@ fi
 
 # ── 11. 凭证摘要 ──
 step "11. 凭证"
-cat > /root/cakeclaw-credentials.txt << EOF
-cakeclaw 凭证 (部署: $(date -u +%Y-%m-%dT%H:%M:%SZ))
+cat > /root/openclaw-credentials.txt << EOF
+openclaw 凭证 (部署: $(date -u +%Y-%m-%dT%H:%M:%SZ))
 =========================================
 运行时环境: /data/etc/openclaw/runtime.env
 Token 读取:  grep OPENCLAW_GATEWAY_TOKEN /data/etc/openclaw/runtime.env
 EOF
-chmod 600 /root/cakeclaw-credentials.txt
-ok "凭证摘要: /root/cakeclaw-credentials.txt"
-
-# ── 12. 知识库 ──
-for f in environment decisions incidents projects; do
-  touch "/data/knowledge/${f}.md" 2>/dev/null || true
-done
-
+chmod 600 /root/openclaw-credentials.txt
+ok "凭证摘要: /root/openclaw-credentials.txt"
 
 # ── 12.5 模型 Provider 配置（交互）──
 # 引导用户选择哪家 API（OpenAI / Claude / Azure / OpenAI 兼容），按各家预设好 baseUrl 默认值、
@@ -898,7 +801,7 @@ configure_provider() {
   info "正在自动拉取可用模型列表..."
   P_TYPE="${P_TYPE}" P_URL="${P_URL}" P_KEY="${P_KEY}" P_AUTH="${P_AUTH}" \
     P_MODELS_URL="${P_MODELS_URL}" P_API_VERSION="${P_API_VERSION}" \
-  python3 - << 'PYEOF' > /tmp/cakeclaw-models.txt 2>/dev/null
+  python3 - << 'PYEOF' > /tmp/openclaw-models.txt 2>/dev/null
 import json, os, sys, urllib.request
 ptype = os.environ.get("P_TYPE", "4")
 url = os.environ.get("P_MODELS_URL", "") or os.environ.get("P_URL", "")
@@ -951,19 +854,19 @@ PYEOF
 
 
   # 让用户勾选模型
-  if [ -s /tmp/cakeclaw-models.txt ]; then
+  if [ -s /tmp/openclaw-models.txt ]; then
     echo ""
     echo "  检测到以下模型，直接回车 = 全部加入；输入编号逗号分隔 = 只选部分；输入单个模型 id 也可："
-    nl -ba /tmp/cakeclaw-models.txt
+    nl -ba /tmp/openclaw-models.txt
     prompt "  选择（回车=全部）: " SEL
     if [ -z "${SEL}" ]; then
-      P_MODELS=$(paste -sd'\n' /tmp/cakeclaw-models.txt)
+      P_MODELS=$(paste -sd'\n' /tmp/openclaw-models.txt)
     else
       P_MODELS=""
       for n in $(echo "${SEL}" | tr ',' '\n'); do
         n="$(echo "${n}" | tr -d ' ')"
         [ -z "${n}" ] && continue
-        line=$(sed -n "${n}p" /tmp/cakeclaw-models.txt 2>/dev/null)
+        line=$(sed -n "${n}p" /tmp/openclaw-models.txt 2>/dev/null)
         if [ -n "${line}" ]; then
           P_MODELS="${P_MODELS}${line}\n"
         else
@@ -974,7 +877,7 @@ PYEOF
   else
     prompt "  未能自动拉取模型，请手动输入一个模型 id（如 gpt-4o-mini）: " P_MODELS
   fi
-  rm -f /tmp/cakeclaw-models.txt
+  rm -f /tmp/openclaw-models.txt
 
   [ -n "${P_MODELS}" ] || { info "未选择任何模型，取消 provider"; return 0; }
 
@@ -1012,29 +915,29 @@ PYEOF
   NEED_RESTART=true
 }
 
-# 非交互自动配置（CI / 无 TTY / 一键脚本）：通过 CAKECLAW_PROVIDER_* 环境变量（可写在 .env）
+# 非交互自动配置（CI / 无 TTY / 一键脚本）：通过 OPENCLAW_PROVIDER_* 环境变量（可写在 .env）
 # 注入单个 provider，复用与交互流程完全相同的那段 python 原子 merge 逻辑，不覆盖已有字段。
-# 若未提供 CAKECLAW_PROVIDER_BASE_URL 则不配置。
+# 若未提供 OPENCLAW_PROVIDER_BASE_URL 则不配置。
 configure_provider_noninteractive() {
   GWJSON="/data/state/openclaw.json"
   [ -f "${GWJSON}" ] || { info "openclaw.json 不存在，跳过 provider 配置"; return 0; }
 
-  local P_NAME="${CAKECLAW_PROVIDER_NAME:-}"
-  local P_URL="${CAKECLAW_PROVIDER_BASE_URL:-}"
-  local P_API="${CAKECLAW_PROVIDER_API:-openai-completions}"
-  local P_KEY="${CAKECLAW_PROVIDER_KEY:-}"
-  local P_MODELS_IN="${CAKECLAW_PROVIDER_MODELS:-}"
+  local P_NAME="${OPENCLAW_PROVIDER_NAME:-}"
+  local P_URL="${OPENCLAW_PROVIDER_BASE_URL:-}"
+  local P_API="${OPENCLAW_PROVIDER_API:-openai-completions}"
+  local P_KEY="${OPENCLAW_PROVIDER_KEY:-}"
+  local P_MODELS_IN="${OPENCLAW_PROVIDER_MODELS:-}"
 
-  [ -n "${P_URL}" ] || { info "未设置 CAKECLAW_PROVIDER_BASE_URL，跳过 provider 自动配置"; return 0; }
+  [ -n "${P_URL}" ] || { info "未设置 OPENCLAW_PROVIDER_BASE_URL，跳过 provider 自动配置"; return 0; }
   [ -n "${P_NAME}" ] || P_NAME="my-provider"
 
-  # 模型：优先用 CAKECLAW_PROVIDER_MODELS（逗号分隔）；为空则尝试自动拉 /models，仍空则跳过 models 字段
+  # 模型：优先用 OPENCLAW_PROVIDER_MODELS（逗号分隔）；为空则尝试自动拉 /models，仍空则跳过 models 字段
   local P_MODELS=""
   if [ -n "${P_MODELS_IN}" ]; then
     P_MODELS="$(echo "${P_MODELS_IN}" | tr ',' '\n' | sed '/^[[:space:]]*$/d')"
   else
     info "尝试自动拉取模型列表（baseUrl: ${P_URL}）..."
-    P_URL="${P_URL}" P_KEY="${P_KEY}" python3 - << 'PYEOF' > /tmp/cakeclaw-models.txt 2>/dev/null || true
+    P_URL="${P_URL}" P_KEY="${P_KEY}" python3 - << 'PYEOF' > /tmp/openclaw-models.txt 2>/dev/null || true
 import json, os, sys, urllib.request
 base = os.environ.get("P_URL", "").rstrip("/")
 key = os.environ.get("P_KEY", "")
@@ -1053,9 +956,9 @@ for u in (base + "/models", base.rstrip("/v1") + "/models"):
     except Exception:
         continue
 PYEOF
-    if [ -s /tmp/cakeclaw-models.txt ]; then
-      P_MODELS="$(cat /tmp/cakeclaw-models.txt)"
-      rm -f /tmp/cakeclaw-models.txt
+    if [ -s /tmp/openclaw-models.txt ]; then
+      P_MODELS="$(cat /tmp/openclaw-models.txt)"
+      rm -f /tmp/openclaw-models.txt
     fi
   fi
 
@@ -1088,14 +991,14 @@ PYEOF
   NEED_RESTART=true
 }
 
-# 非交互环境（如 CI / 无 TTY）：有 CAKECLAW_PROVIDER_BASE_URL 则自动配置，否则才跳过
+# 非交互环境（如 CI / 无 TTY）：有 OPENCLAW_PROVIDER_BASE_URL 则自动配置，否则才跳过
 if $INTERACTIVE; then
   configure_provider
 else
-  if [ -n "${CAKECLAW_PROVIDER_BASE_URL:-}" ]; then
+  if [ -n "${OPENCLAW_PROVIDER_BASE_URL:-}" ]; then
     configure_provider_noninteractive
   else
-    info "非交互环境，且未设置 CAKECLAW_PROVIDER_BASE_URL，跳过模型 provider 配置"
+    info "非交互环境，且未设置 OPENCLAW_PROVIDER_BASE_URL，跳过模型 provider 配置"
   fi
 fi
 
@@ -1228,7 +1131,6 @@ if $NEED_RESTART; then
   info "检测到配置/补丁改动，重启 Gateway 使其生效..."
   COMPOSE_PROFILES=""
   $WITH_MIHOMO && COMPOSE_PROFILES="${COMPOSE_PROFILES} --profile mihomo"
-  $WITH_WATCHDOG && COMPOSE_PROFILES="${COMPOSE_PROFILES} --profile watchdog"
   docker compose -f /data/etc/openclaw/docker-compose.yml ${COMPOSE_PROFILES} up -d 2>&1 || fail "Gateway 重启失败"
   wait_gateway_ready
 fi
@@ -1240,7 +1142,7 @@ verify_control_ui
 # ── 完成 ──
 echo ""
 echo "========================================"
-echo -e "${GREEN}  cakeclaw 部署完成${NC}"
+echo -e "${GREEN}  openclaw 部署完成${NC}"
 echo "========================================"
 echo "  Gateway : 127.0.0.1:${GATEWAY_PORT}"
 if [ -n "$DOMAIN" ]; then
@@ -1263,5 +1165,5 @@ echo "           }"
 echo "         }"
 echo "       }"
 echo "     }"
-echo "  3. 重启 Gateway 生效: docker restart cakeclaw-gateway"
+echo "  3. 重启 Gateway 生效: docker restart openclaw-gateway"
 echo "========================================"

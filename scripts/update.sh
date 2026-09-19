@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# cakeclaw 更新脚本
+# openclaw 更新脚本
 # 用法: sudo bash update.sh <新镜像tag>
 # 例如: sudo bash update.sh ghcr.io/openclaw/openclaw:2026.7.2
 
@@ -27,7 +27,7 @@ bash "$SCRIPT_DIR/backup.sh" 2>/dev/null || echo "  备份脚本不存在或失�
 
 # 2. 停旧容器
 echo "[2/4] 停止旧容器..."
-docker rm -f cakeclaw-gateway 2>/dev/null || true
+docker rm -f openclaw-gateway 2>/dev/null || true
 
 # 3. 拉新镜像
 echo "[3/4] 拉取新镜像..."
@@ -82,18 +82,18 @@ docker compose -f "${COMPOSE_FILE}" up -d
 # 6. 验证：等健康检查 healthy（非仅 Up），覆盖 start_period 120s
 for _ in $(seq 1 36); do
   sleep 5
-  HS=$(docker inspect --format '{{.State.Health.Status}}' cakeclaw-gateway 2>/dev/null || echo "no-health")
+  HS=$(docker inspect --format '{{.State.Health.Status}}' openclaw-gateway 2>/dev/null || echo "no-health")
   if [ "${HS}" = "healthy" ]; then
-    echo "[OK] cakeclaw-gateway healthy"
-    docker logs cakeclaw-gateway --tail 10 2>&1
+    echo "[OK] openclaw-gateway healthy"
+    docker logs openclaw-gateway --tail 10 2>&1
     exit 0
   fi
   if [ "${HS}" = "unhealthy" ]; then
     echo "[FAIL] Gateway healthcheck 失败 (unhealthy)"
-    docker logs cakeclaw-gateway --tail 30 2>&1
+    docker logs openclaw-gateway --tail 30 2>&1
     exit 1
   fi
 done
 echo "[FAIL] Gateway 未在 180s 内变为 healthy"
-docker logs cakeclaw-gateway --tail 30 2>&1
+docker logs openclaw-gateway --tail 30 2>&1
 exit 1

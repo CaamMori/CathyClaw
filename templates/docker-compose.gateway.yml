@@ -76,28 +76,6 @@ services:
     entrypoint: ["/mihomo"]
     command: ["-f", "/sub.yaml"]
 
-  # 可选：gateway 健康兜底 watchdog（docker compose --profile watchdog up -d）
-  recovery-watchdog:
-    profiles: ["watchdog"]
-    image: docker:cli
-    container_name: openclaw-recovery-watchdog
-    restart: unless-stopped
-    network_mode: host
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-      - /var/log/watchdog:/var/log
-    entrypoint:
-      - /bin/sh
-      - -c
-      - |
-        while true; do
-          S=$(docker inspect -f '{{.State.Health.Status}}' openclaw-gateway 2>/dev/null)
-          if [ "$$S" != "healthy" ]; then
-            echo "[$$(date)] Gateway unhealthy ($$S), restarting" >> /var/log/watchdog.log
-            docker restart openclaw-gateway
-          fi
-          sleep 15
-        done
 
 networks:
   default:
