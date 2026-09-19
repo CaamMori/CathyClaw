@@ -165,7 +165,7 @@ fi
 DOMAIN="${DOMAIN:-}"
 GATEWAY_IMAGE="${GATEWAY_IMAGE:-ghcr.io/openclaw/openclaw:2026.9.4}"
 MIHOMO_IMAGE="${MIHOMO_IMAGE:-metacubex/mihomo:latest}"
-DOCKER_GROUP_ID="${DOCKER_GROUP_ID:-999}"
+DOCKER_GROUP_ID="${DOCKER_GROUP_ID:-}"
 # .env 里显式写 MIHOMO_ENABLE 也算用户表态（0=强制关，1=强制开），跳过自动探测
 case "${MIHOMO_ENABLE:-}" in
   1) WITH_MIHOMO=true;  MIHOMO_DECIDED=true ;;
@@ -559,13 +559,29 @@ COMPOSE_FILE="/data/etc/openclaw/docker-compose.yml"
 #
 # DOCKER_GROUP_ID 必须是纯数字：Compose 会把它当 GID 解析，非数字会以
 #   "unable to find group <值>: no matching entries in group file"
-# 直接拒绝启动整个 stack。空值或非数字一律回退到实测 socket 属组。
+# 直接拒绝启动整个 stack。
+#
+# 取值优先级：显式配置 > 实测 socket 属组。
+# 注意：这里【不能】给一个数字兜底（旧版写 999）。因为下面的一致性检查
+# 只看"是不是数字"，一个合法的数字兜底会让实测分支永远不执行——
+# 实测 socket 属组在多数发行版上并不是 999（Docker 官方包常见 988/998/
+# 其它值），于是容器以错误的附加组启动，沙箱内一调 docker 就：
+#   permission denied while trying to connect to the docker API
+#   at unix:///var/run/docker.sock
+# 所以未显式配置时留空，交由实测决定。
 DOCKER_GROUP_ID="$(printf '%s' "${DOCKER_GROUP_ID:-}" | tr -d '[:space:]')"
+SOCKET_GID="$(stat -c '%g' /var/run/docker.sock 2>/dev/null || true)"
 if ! printf '%s' "${DOCKER_GROUP_ID}" | grep -qE '^[0-9]+$'; then
-  AUTODETECTED_GID="$(stat -c '%g' /var/run/docker.sock 2>/dev/null || echo 999)"
-  [ -n "${DOCKER_GROUP_ID}" ] && warn "DOCKER_GROUP_ID='${DOCKER_GROUP_ID}' 非数字，已回退为实测 ${AUTODETECTED_GID}"
-  DOCKER_GROUP_ID="${AUTODETECTED_GID}"
+  [ -n "${DOCKER_GROUP_ID}" ] && warn "DOCKER_GROUP_ID='${DOCKER_GROUP_ID}' 非数字，已回退为实测 socket 属组"
+  DOCKER_GROUP_ID="${SOCKET_GID:-999}"
+else
+  # 显式配置了数字，但与本机 socket 属组不一致时给出提示（不强制覆盖：
+  # 用户可能刻意对齐到一个宿主组名，属于高级用法）。
+  if [ -n "${SOCKET_GID}" ] && [ "${DOCKER_GROUP_ID}" != "${SOCKET_GID}" ]; then
+    warn "DOCKER_GROUP_ID=${DOCKER_GROUP_ID} 与本机 docker.sock 属组 ${SOCKET_GID} 不一致；若沙箱内 docker 报 permission denied，请改为 ${SOCKET_GID}"
+  fi
 fi
+info "docker.sock 属组: ${DOCKER_GROUP_ID}（宿主实测 ${SOCKET_GID:-未知}）"
 # Telegram API 死 IP：仅境内机（TUN 模式）需要钉住防 DNS 污染；海外机直连不需要。
 TELEGRAM_API_IP=""
 if $WITH_MIHOMO; then
