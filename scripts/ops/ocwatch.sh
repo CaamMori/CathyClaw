@@ -19,7 +19,9 @@ DISK_WARN=85                         # 磁盘使用率告警阈值 %
 DISK_CRIT=92                         # 磁盘危险阈值 %
 MEM_WARN=90                          # 内存使用率告警阈值 %
 # 告警目标 Telegram chat id（留空则仅日志不自检推送）。可在 /etc/ocwatch.conf 覆盖。
-ALERT_TARGET="${OCWATCH_ALERT_TARGET:-${OWNER_TELEGRAM_ID}}"
+# 注意 set -u：两个来源都必须给默认值，否则未配置 Telegram 的机器一启动就
+# "OWNER_TELEGRAM_ID: unbound variable" 崩溃（systemd 会无限重启）。留空是合法状态。
+ALERT_TARGET="${OCWATCH_ALERT_TARGET:-${OWNER_TELEGRAM_ID:-}}"
 
 if [ -f /etc/ocwatch.conf ]; then
   # shellcheck disable=SC1091
