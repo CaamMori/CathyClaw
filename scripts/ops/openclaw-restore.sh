@@ -13,6 +13,11 @@
 # 环境变量：
 #   ROOT_PREFIX   把整棵路径树挪到别处，仅用于离线演练/自测；
 #                 置空即生产行为（默认）。演练时会跳过 Gateway/systemd 启停。
+#   ALLOW_UNVERIFIED=1
+#                 若归档缺少 .sha256 校验和，默认【拒绝还原】。
+#                 确认该归档来源可信、愿意承担风险时，用此变量显式放行。
+#                 默认拒绝是有意的：还原是破坏性操作，"解包到一半才发现内容
+#                 不对"会留下半毁状态，比一开始就拒绝糟得多。
 #
 # 流程：列备份 → 校验 sha256 → 停止服务 → 存还原前快照 → 解包 → 修权限
 #       → 重启服务 → 验证健康。
@@ -133,8 +138,18 @@ if [ -f "${ARCHIVE}.sha256" ]; then
     fail "SHA256 校验失败——备份已损坏，拒绝还原（换一个备份或从异地副本恢复）"
   fi
 else
-  warn "该备份没有 .sha256 校验和（可能是旧版 nightly-backup.sh 生成的）"
-  warn "将仅做归档可读性检查，无法证明内容未被篡改/损坏"
+  # 【设计修正】原实现只 warn 后继续还原，等于"无法验证完整性也照做"。
+  # 还原是破坏性操作：一个无法证明未被篡改/损坏的归档，其风险等同于来源不明的二进制。
+  # 在灾难恢复场景下，"解包到一半才发现内容不对"比"一开始就拒绝"糟得多——
+  # 前者会留下半毁状态。因此这里默认拒绝，需要人工明确承担风险时才放行。
+  if [ "${ALLOW_UNVERIFIED:-0}" = "1" ]; then
+    warn "该备份没有 .sha256 校验和，且已显式设置 ALLOW_UNVERIFIED=1——继续还原"
+    warn "本次还原无法证明归档内容未被篡改/损坏，风险由操作者承担"
+  else
+    fail "该备份没有 .sha256 校验和（可能是旧版 nightly-backup.sh 生成的），无法验证完整性——拒绝还原。
+       如确认该归档来源可信，可用 ALLOW_UNVERIFIED=1 显式放行：
+         sudo ALLOW_UNVERIFIED=1 $0 $(basename "$ARCHIVE")"
+  fi
 fi
 
 tar -tzf "$ARCHIVE" >/dev/null 2>&1 || fail "归档不可读: $ARCHIVE"
@@ -174,18 +189,36 @@ done
 if [ "${#SNAP_PATHS[@]}" -eq 0 ]; then
   rm -f "$TMP_SNAP"
   warn "还原前系统已无 /data/state 与 /data/etc/openclaw，无可快照内容（继续还原）"
-elif tar -czf "$TMP_SNAP" -C "${ROOT_PREFIX}/" \
-      --exclude='data/state/backups' --exclude='data/state/backups/*' \
-      "${SNAP_PATHS[@]}" 2>/dev/null \
-   && [ -s "$TMP_SNAP" ] && tar -tzf "$TMP_SNAP" >/dev/null 2>&1; then
+else
+  # 【设计修正】原实现把 tar 创建、非空检查、可读性复核串成一条 elif，
+  # 任一环失败就走 else 只 warn 后继续——即"没有退路仍然做破坏性还原"。
+  # 现改为：分步执行、失败即终止；且把 stderr 落盘，避免 2>/dev/null
+  # 把真正原因吞掉（上一版正是因此无法诊断那次偶发失败）。
+  SNAP_ERR="$(mktemp /tmp/openclaw-snapshot-err-XXXXXX)"
+  if ! tar -czf "$TMP_SNAP" -C "${ROOT_PREFIX}/" \
+        --exclude='data/state/backups' --exclude='data/state/backups/*' \
+        "${SNAP_PATHS[@]}" 2>"$SNAP_ERR"; then
+    warn "快照创建失败，tar 报错如下："
+    sed 's/^/        /' "$SNAP_ERR" >&2
+    rm -f "$TMP_SNAP" "$SNAP_ERR"
+    fail "无法创建还原前快照——拒绝继续（破坏性还原必须有退路）。请先排查磁盘空间与权限。"
+  fi
+  if [ ! -s "$TMP_SNAP" ]; then
+    rm -f "$TMP_SNAP" "$SNAP_ERR"
+    fail "还原前快照为空——拒绝继续（破坏性还原必须有退路）"
+  fi
+  if ! tar -tzf "$TMP_SNAP" >/dev/null 2>"$SNAP_ERR"; then
+    warn "快照可读性复核失败，tar 报错如下："
+    sed 's/^/        /' "$SNAP_ERR" >&2
+    rm -f "$TMP_SNAP" "$SNAP_ERR"
+    fail "还原前快照不可读——拒绝继续（不能用损坏的快照当退路）"
+  fi
+  rm -f "$SNAP_ERR"
   mv "$TMP_SNAP" "$SNAP"
   chmod 600 "$SNAP"
   ok "快照已保存（$(du -h "$SNAP" | cut -f1)，含 ${#SNAP_PATHS[@]} 个顶层路径）"
   # 快照只保留最近 3 份
   ls -1t "$SNAP_DIR"/pre-restore-*.tar.gz 2>/dev/null | tail -n +4 | xargs -r rm -f
-else
-  rm -f "$TMP_SNAP"
-  warn "快照保存失败（继续还原，但失去回退能力）"
 fi
 
 # ── 3) 停止服务 ──
@@ -242,6 +275,24 @@ for s in selfcheck.py mihomo-guard.sh nightly-backup.sh openclaw-restore.sh; do
   [ -f "${ROOT_PREFIX}/usr/local/bin/$s" ] && chmod +x "${ROOT_PREFIX}/usr/local/bin/$s" 2>/dev/null || true
 done
 [ -d "${ROOT_PREFIX}/data/state/workspace/task-engine" ] && chown -R 1000:1000 "${ROOT_PREFIX}/data/state/workspace/task-engine" 2>/dev/null || true
+# 【关键】上面的 chown -R data/state 会连 /data/state/backups 一起改成 1000:1000。
+# 备份目录必须归 root：容器内 uid 1000 若能改写备份，则备份可被篡改，
+# 基于 sha256 的完整性防线随之失效。这里统一归位回 root:root 并收紧为 700/600。
+for p in \
+    "${ROOT_PREFIX}/data/state/backups" \
+    "${ROOT_PREFIX}/data/state/backups/config" \
+    "${ROOT_PREFIX}/data/state/backups/pre-restore"; do
+  if [ -d "$p" ]; then
+    chown root:root "$p" 2>/dev/null || true
+    chmod 700 "$p" 2>/dev/null || true
+  fi
+done
+for f in "${ROOT_PREFIX}"/data/state/backups/config/* ; do
+  if [ -f "$f" ]; then chown root:root "$f" 2>/dev/null || true; chmod 600 "$f" 2>/dev/null || true; fi
+done
+for f in "${ROOT_PREFIX}"/data/state/backups/pre-restore/* ; do
+  if [ -f "$f" ]; then chown root:root "$f" 2>/dev/null || true; chmod 600 "$f" 2>/dev/null || true; fi
+done
 ok "权限已修复"
 
 # ── 6) 重启服务 ──
