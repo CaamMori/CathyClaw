@@ -148,3 +148,34 @@ openclaw.json 引用了 5 个环境变量，其中 1 个已就绪。
   TruffleHog 三个 job 尚未首次运行，第三方 action 版本可能需要按实际输出调整。
 - **模型调用路径未端到端验证**。Gateway 日志显示 `agent model: openai/gpt-5.6-sol`
   （走内置默认，非 `openclaw.json` 的 `models.providers`），但未实际发消息验证。
+
+## 九、CI 首次上线踩到的三个坑
+
+`Security` workflow 在真实 runner 上暴露了三个问题，都是"配置看着对、跑起来必错"的类型。
+记录于此，因为这类错误本地无法发现——只有推上去跑一次才知道。
+
+| # | 症状 | 根因 | 修正 |
+|---|---|---|---|
+| 1 | 11s 失败，未进测试 | 修之前的 `shellcheck` 因 `install.sh` 有个只写不读的变量（SC2034）报错，导致 CI 长期红着 —— 红灯被当成常态，掩盖了新问题 | 删掉死变量 |
+| 2 | Trivy job 43s 失败 | `aquasecurity/trivy-action@0.28.0` —— 该版本号**不存在**，且缺 `v` 前缀。报 `Unable to resolve action` | 查 API 后改 `v0.36.0` |
+| 3 | TruffleHog job 26s 失败 | 我设了 `base: default_branch` + `head: HEAD`。这套配置只在 PR 场景成立；**push 到 master 时两者是同一提交**，action 主动报错 `BASE and HEAD commits are the same. TruffleHog won't scan anything.` | 只给 `path`，由 action 按事件类型自行处理 |
+
+三条的共同教训：**action 版本与事件相关配置必须查证，不能凭印象写。**
+
+顺带把 `trufflesecurity/trufflehog@main` 改为锁定 `v3.97.5`：CI 的判定标准
+不该随上游推送漂移，`main` 上的行为变更会让结果在无人改代码时变红。
+
+### 最终状态（全部通过）
+
+| Workflow | Job | 结果 |
+|---|---|---|
+| Security | 密钥泄露扫描 (Gitleaks + 仓库内 `.gitleaks.toml`) | success |
+| Security | TruffleHog 验证型扫描 | success |
+| Security | IaC/配置扫描 (Trivy) | success |
+| Security | Python 依赖审计 (pip-audit) | success |
+| CI | syntax | success |
+| CI | shellcheck | success |
+| CI | task-engine-test（74 个测试） | success |
+
+这是该仓库首次 CI 全绿。Gitleaks 使用仓库内自定义规则在真实 runner 上
+报 0 误报——与本地实测一致。
