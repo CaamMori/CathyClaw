@@ -17,7 +17,14 @@
       "enabled": true,
       "botToken": "${TELEGRAM_BOT_TOKEN}",
       "allowFrom": ["tg:${TELEGRAM_OWNER_ID}"],
-      "streaming": "partial"
+      "streaming": {
+        "mode": "progress",
+        "progress": {
+          "toolProgress": true,
+          "commandText": "status",
+          "commentary": false
+        }
+      }
     }
   },
   "commands": {
@@ -38,7 +45,21 @@
       },
       "thinkingDefault": "off",
       "verboseDefault": "off",
-      "timeoutSeconds": 600
+      "timeoutSeconds": 600,
+      "sandbox": {
+        "browser": {
+          "enabled": true,
+          "network": "openclaw-sandbox-browser",
+          "cdpPort": 9222
+        },
+        "docker": {
+          "binds": [],
+          "network": "bridge",
+          "dangerouslyAllowExternalBindSources": false,
+          "dangerouslyAllowReservedContainerTargets": false,
+          "dangerouslyAllowContainerNamespaceJoin": false
+        }
+      }
     },
     "ownership": "explicit",
     "entries": {
@@ -46,8 +67,18 @@
         "name": "Main",
         "workspace": "/home/node/.openclaw/workspace",
         "identity": { "emoji": "🌙" },
+        "reasoningDefault": "stream",
         "sandbox": {
           "docker": {
+            "binds": [
+              "/data/state/workspace/task-engine:/opt/task-engine:rw",
+              "/data/state/workspace/memory:/workspace/memory:rw",
+              "/data/state/sandbox-tools:/opt/tools:rw"
+            ],
+            "network": "container:openclaw-gateway",
+            "dangerouslyAllowReservedContainerTargets": true,
+            "dangerouslyAllowExternalBindSources": true,
+            "dangerouslyAllowContainerNamespaceJoin": true,
             "env": {
               "GH_TOKEN": "${GH_TOKEN}",
               "GITHUB_TOKEN": "${GH_TOKEN}",
@@ -65,10 +96,22 @@
         "name": "Guest",
         "workspace": "~/.openclaw/workspace-guest",
         "sandbox": {
-          "browser": { "enabled": true, "autoStart": true },
+          "browser": {
+            "enabled": true,
+            "autoStart": true,
+            "binds": [],
+            "allowHostControl": false
+          },
           "docker": {
+            "binds": [],
+            "network": "container:openclaw-gateway",
+            "dangerouslyAllowReservedContainerTargets": false,
+            "dangerouslyAllowExternalBindSources": false,
+            "dangerouslyAllowContainerNamespaceJoin": true,
             "env": {
-              "TAVILY_API_KEY": "${TAVILY_API_KEY}"
+              "TAVILY_API_KEY": "${TAVILY_API_KEY}",
+              "PYTHONPATH": "/workspace/.sandbox-tools",
+              "PATH": "/workspace/.sandbox-tools/bin:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"
             }
           }
         },

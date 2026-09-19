@@ -13,15 +13,13 @@ STATE=/var/run/ocwatch.state
 HIST=/var/run/ocwatch.prev          # 上一轮状态（供切换检测）
 INTERVAL=60
 MH_MAXFAIL=3
-BR_MAXFAIL=3                           # 浏览器连续拉起失败告警阈值
-GW_MAXFAIL=3                           # 网关健康检查连续失败阈值：单发超时(CPU尖峰)不误报
 DISK_WARN=85                         # 磁盘使用率告警阈值 %
 DISK_CRIT=92                         # 磁盘危险阈值 %
 MEM_WARN=90                          # 内存使用率告警阈值 %
-# 告警目标 Telegram chat id（留空则仅日志不自检推送）。可在 /etc/ocwatch.conf 覆盖。
-# 注意 set -u：两个来源都必须给默认值，否则未配置 Telegram 的机器一启动就
-# "OWNER_TELEGRAM_ID: unbound variable" 崩溃（systemd 会无限重启）。留空是合法状态。
-ALERT_TARGET="${OCWATCH_ALERT_TARGET:-${OWNER_TELEGRAM_ID:-}}"
+# 告警目标 Telegram chat id（留空则仅日志推送）。可在 /etc/ocwatch.conf 覆盖。
+# 注意：上游生产机曾把具体 chat id 硬编码在这里，移植时改为空默认值——
+# 具体 ID 属于个人信息，不能进入公开仓库，应由部署方在 /etc/ocwatch.conf 提供。
+ALERT_TARGET="${OCWATCH_ALERT_TARGET:-}"
 
 if [ -f /etc/ocwatch.conf ]; then
   # shellcheck disable=SC1091
@@ -60,15 +58,11 @@ check_mihomo() {
 }
 
 check_browser() {
-  # 2026.9.4 按需启停语义：gateway 自有 chromium 空闲时 status.running=false 是正常态
-  # （enabled 才是服务位，selfcheck browser_running 已同语义）。
-  # 旧判据查 running 会把空闲态当 down，且"start 后复验 running"永远失败 → 每 3 轮告警刷屏。
-  # 只认 enabled：false=服务位被关（真异常需人工）；true=ok（running 与否都是按需正常态）。
   local st
   st=$(timeout 15 docker exec "$GW" openclaw browser status --json 2>/dev/null)
-  if echo "$st" | grep -q '"enabled":\s*false'; then
+  if echo "$st" | grep -q '"running":\s*false'; then
     echo down
-  elif echo "$st" | grep -q '"enabled":\s*true'; then
+  elif echo "$st" | grep -q '"running":\s*true'; then
     echo ok
   else
     echo unknown
@@ -111,28 +105,6 @@ check_sandbox_paths() {
   esac
 }
 
-# mihomo 恢复：mihomo-tun 已纳入 docker compose 管理（/data/scripts/docker-compose.gateway.yml）。
-# 它的 network_mode 为 service:openclaw-gateway，gateway 被 compose 重建后由 compose 自动跟随，
-# 因此这里只需 compose up --force-recreate / restart，绝不能再 docker rm -f + docker run 造野容器——
-# 否则会丢掉 compose 标签、与 compose 状态漂移，正是此前清理掉的「野容器」技术债。
-COMPOSE_FILE=/data/scripts/docker-compose.gateway.yml
-
-recreate_mihomo() {
-  if docker compose -f "$COMPOSE_FILE" up -d --force-recreate "$MH" >/dev/null 2>&1; then
-    return 0
-  fi
-  docker compose -f "$COMPOSE_FILE" restart "$MH" >/dev/null 2>&1
-}
-
-# 先试重启；失败则走 compose 重建（gateway 可能被 compose recreate，netns 引用需刷新）。
-bounce_mihomo() {
-  if docker restart "$MH" >/dev/null 2>&1; then
-    return 0
-  fi
-  log "mihomo restart 失败（gateway 可能被重建，容器 ID 已变）→ 重建 $MH"
-  recreate_mihomo
-}
-
 netns_stale() {
   local gw_start mh_start
   gw_start=$(docker inspect -f '{{.State.StartedAt}}' "$GW" 2>/dev/null)
@@ -143,21 +115,8 @@ netns_stale() {
 }
 
 mh_fails=0
-gw_fails=0
-br_fails=0
 while true; do
-  # gateway 健康检查：单次超时(BAD)可能因 CPU 尖峰导致 RPC 超时，属瞬时抖动。
-  # 累计连续失败达到 GW_MAXFAIL 才判定为真正异常并告警；否则压制为 ok，避免误报。
-  if [ "$(check_gateway)" = "BAD" ]; then
-    gw_fails=$((gw_fails + 1))
-  else
-    gw_fails=0
-  fi
-  if [ "$gw_fails" -ge "$GW_MAXFAIL" ]; then
-    gw=BAD
-  else
-    gw=ok
-  fi
+  gw=$(check_gateway)
   mh=$(check_mihomo)
   br=$(check_browser)
   dk=$(check_disk)
@@ -166,32 +125,21 @@ while true; do
   # 沙箱挂载路径自愈（幂等，无变更时静默）
   check_sandbox_paths
 
-  # gateway 重启后 mihomo netns 需刷新（compose 会自动跟随，这里兜底检测并重建）
+  # gateway 重启后 mihomo netns 失效 -> 立即重绑（重置失败计数，避免误判为普通抖动）
   if [ "$(netns_stale)" = "yes" ]; then
     if [ "$mh" != "ok" ] || [ "$gw" = "ok" ]; then
       alert "检测到 gateway 已重启，mihomo netns 需重绑 → 重启 mihomo-tun"
-      if ! bounce_mihomo; then
-        alert "mihomo 重绑失败，将在下一轮重试"
-      fi
+      docker restart "$MH" >/dev/null 2>&1 || true
       mh_fails=0
       mh=ok   # 乐观置位，下一轮实测确认
     fi
   fi
 
-  # 浏览器 down -> 先拉起，复验成功则静默（gateway 重启后 browser 懒启动属预期现象，不吵人）；
-  # 连续 BR_MAXFAIL 轮仍拉不起才告警
+  # 浏览器 down -> 拉起（不计入告警刷屏，拉起即恢复）
   if [ "$br" = "down" ]; then
-    # enabled=false 是配置面问题，browser start 救不了；且按需启停语义下空闲态
-    # start 会被 daemon 回收，旧"拉起+复验 running"永远失败（告警风暴根源，见 check_browser 注释）。
-    # 仍跑 ensure-browser.sh 保证二进制/依赖在位（幂等，可用时秒级返回）。
-    /usr/local/bin/ensure-browser.sh || true
-    br_fails=$((br_fails + 1))
-    if [ "$br_fails" -ge "$BR_MAXFAIL" ]; then
-      alert "openclaw browser 服务位 enabled=false（配置面被关），需要人工检查"
-      br_fails=0
-    fi
-  elif [ "$br" = "ok" ]; then
-    br_fails=0
+    alert "浏览器未运行，尝试拉起"
+    docker exec "$GW" openclaw browser start >/dev/null 2>&1 || true
+    br=starting
   fi
 
   # mihomo 静默死亡 -> 连续失败达到阈值则重启
@@ -199,9 +147,7 @@ while true; do
     mh_fails=$((mh_fails + 1))
     if [ "$mh_fails" -ge "$MH_MAXFAIL" ]; then
       alert "mihomo 代理连续 ${mh_fails} 次不可用，尝试重启"
-      if ! bounce_mihomo; then
-        alert "mihomo 恢复失败，将在下一轮重试"
-      fi
+      docker restart "$MH" >/dev/null 2>&1 || true
       mh_fails=0
     fi
   else

@@ -1096,7 +1096,18 @@ ok "Control UI 来源已允许: ${CONTROL_UI_ORIGIN}"
 
 # ── 8. SOUL + AGENTS ──
 step "8. Agent 策略"
-cp "$PROJECT_DIR/templates/SOUL.md" /data/workspace/SOUL.md 2>/dev/null || cat > /data/workspace/SOUL.md << 'SOUL'
+# 【为什么写 /data/state/workspace 而不是 /data/workspace】
+# /data/state 是 Gateway 容器的 bind 源（容器内挂为 /home/node/.openclaw），
+# 因此容器实际读取的是 /data/state/workspace/AGENTS.md。
+# 早期版本写 /data/workspace/AGENTS.md 并依赖 /data/workspace 是软链；
+# 但该路径在真实机器上通常已作为【真实目录】存在（含 model_routing.json、README.md 等），
+# 于是第 3 步的 [ -e /data/workspace ] 判断为真、软链不会创建——
+# 策略文件被写到一个容器根本看不见的地方，而安装照样打印 ok。这是静默失效。
+WS_DIR=/data/state/workspace
+GW_DIR=/data/state/workspace-guest
+mkdir -p "$WS_DIR" "$GW_DIR"
+
+cp "$PROJECT_DIR/templates/SOUL.md" "$WS_DIR/SOUL.md" 2>/dev/null || cat > "$WS_DIR/SOUL.md" << 'SOUL'
 # Administrator Execution Mode
 ## Identity
 私人高级运维工程师。任务：理解目标 → 分析环境 → 执行操作 → 验证结果 → 交付可用。
@@ -1107,21 +1118,46 @@ cp "$PROJECT_DIR/templates/SOUL.md" /data/workspace/SOUL.md 2>/dev/null || cat >
 - 不确定按不可逆处理
 SOUL
 
-cp "$PROJECT_DIR/templates/AGENTS.md" /data/workspace/AGENTS.md 2>/dev/null || cat > /data/workspace/AGENTS.md << 'AGENTS'
-# Private Dev Agent Policy
-## Core
-管理员指令最高优先级。
-## Secrets
-禁止输出 API Key / Token / 密码。汇报只告知文件路径。
-## Risk
-- 可逆操作：直接执行。
-- 不可逆操作：必须确认。
-- 不确定的按不可逆处理。
-## Execution
-- 容器以非 root 运行，host 级操作受 Docker 安全边界限制。
-- 所有操作通过 Gateway 审计日志记录。
-AGENTS
-ok "策略文件已写入"
+# 模板含 {{AGENT_NAME}} / {{OWNER_NAME}} / {{TELEGRAM_OWNER_ID}} 占位符，
+# 安装时替换为真实值——公开仓库不留个人身份信息。
+fill_identity() {
+  sed -e "s|{{AGENT_NAME}}|${AGENT_NAME:-Mori}|g" \
+      -e "s|{{AGENT_EMOJI}}|${AGENT_EMOJI:-🌙}|g" \
+      -e "s|{{OWNER_NAME}}|${OWNER_NAME:-owner}|g" \
+      -e "s|{{TELEGRAM_OWNER_ID}}|${TELEGRAM_OWNER_ID:-}|g" "$1"
+}
+
+if [ -f "$PROJECT_DIR/templates/AGENTS.md" ]; then
+  fill_identity "$PROJECT_DIR/templates/AGENTS.md" > "$WS_DIR/AGENTS.md"
+  ok "main 策略已写入 $WS_DIR/AGENTS.md"
+else
+  warn "缺少 templates/AGENTS.md"
+fi
+
+if [ -f "$PROJECT_DIR/templates/AGENTS.guest.md" ]; then
+  fill_identity "$PROJECT_DIR/templates/AGENTS.guest.md" > "$GW_DIR/AGENTS.md"
+  ok "guest 策略已写入 $GW_DIR/AGENTS.md"
+fi
+
+# ── 8.1 行为 Skill（按需加载，不进常驻上下文）──
+# 生产实践：AGENTS.md 只保留常驻行为内核，低频流程拆进 Skill，由 description 路由。
+if [ -d "$PROJECT_DIR/templates/skills" ]; then
+  for skill_dir in "$PROJECT_DIR"/templates/skills/*/; do
+    [ -d "$skill_dir" ] || continue
+    sname=$(basename "$skill_dir")
+    for side in "$WS_DIR" "$GW_DIR"; do
+      mkdir -p "$side/skills/$sname"
+      cp "$skill_dir/SKILL.md" "$side/skills/$sname/SKILL.md" 2>/dev/null && \
+        ok "skill $sname -> $side/skills/"
+    done
+  done
+else
+  warn "缺少 templates/skills/，行为 Skill 未安装"
+fi
+
+# 策略与 Skill 属主必须是 Gateway 运行用户，否则容器读不到。
+chown -R 1000:1000 "$WS_DIR" "$GW_DIR" 2>/dev/null || true
+ok "策略文件与行为 Skill 已就位"
 
 # ── 9. 备份 ──
 step "9. 备份"
