@@ -856,19 +856,30 @@ fi
   fi
 
   # 3) docker CLI 包装（沙箱内需要 docker，但不直接暴露宿主 socket 权限）
+  # 幂等要点：这两条路径在重跑时已存在，且历史版本可能把它们误建成了「目录」
+  # （cp 的经典陷阱：目标若是目录，cp 会拷进去而不是覆盖）。因此每次先强制
+  # 清掉目标（-rf 同时覆盖文件和目录两种历史形态），再写入。
   mkdir -p /data/opt/docker-cli
-  HOST_DOCKER="$(command -v docker 2>/dev/null || echo /usr/bin/docker)"
-  if [ -x "$HOST_DOCKER" ]; then
+  HOST_DOCKER=""
+  for cand in "$(command -v docker 2>/dev/null)" /usr/bin/docker /usr/local/bin/docker /bin/docker; do
+    [ -n "$cand" ] || continue
+    # -f 且 -x：既要是普通文件，又要有执行权限；目录/悬空链接一律跳过
+    if [ -f "$cand" ] && [ -x "$cand" ]; then HOST_DOCKER="$cand"; break; fi
+  done
+  if [ -n "$HOST_DOCKER" ]; then
+    rm -rf /data/opt/docker-cli/docker.real /data/opt/docker-cli/docker
     cp "$HOST_DOCKER" /data/opt/docker-cli/docker.real
+    # 包装脚本内部路径必须与真实安装路径一致（此前写死 /usr/local/bin/docker.real，
+    # 与实际的 /data/opt/docker-cli/docker.real 不符，沙箱内会找不到可执行文件）。
     cat > /data/opt/docker-cli/docker <<'DOCKEREOF'
 #!/bin/sh
 # 沙箱内 docker CLI 包装：默认走宿主 docker.sock
-exec /usr/local/bin/docker.real "$@"
+exec /data/opt/docker-cli/docker.real "$@"
 DOCKEREOF
     chmod +x /data/opt/docker-cli/docker /data/opt/docker-cli/docker.real
-    ok "docker-cli 包装安装到 /data/opt/docker-cli"
+    ok "docker-cli 包装安装到 /data/opt/docker-cli（源: ${HOST_DOCKER}）"
   else
-    warn "未找到宿主 docker，跳过 docker-cli 包装"
+    warn "未找到可执行的宿主 docker（command -v 返回的可能是目录），跳过 docker-cli 包装"
   fi
 }
 
