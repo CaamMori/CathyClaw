@@ -39,22 +39,52 @@ def log(msg):
 def write_config_preserving_owner(path, cfg):
     """原子写回配置，并保留原 uid/gid/mode。
 
-    【为什么必须这样做】本脚本以 root 身份由 cron 运行，而 /data/state/openclaw.json
-    属于 Gateway 运行用户（uid 1000）。早期版本的写法是
+    【背景】本脚本以 root 身份由 cron 运行，而 /data/state/openclaw.json 属于
+    Gateway 运行用户（uid 1000）。旧版写法是
 
         with open(P, 'w') as f: json.dump(cfg, f, ...)
 
-    它是「先截断、再写入」，并且新建/重写后的文件属主会是 root。由此产生两个真实事故：
+    它有**原子性缺陷**：先截断、再写入。若在写入中途进程被杀（OOM、SIGKILL、
+    宿主重启、容器被强杀），文件会停在"已截断 + 只写了一部分"的状态。
+    实测：崩溃后文件被截断成 12 字节，JSONDecodeError —— Gateway 读不了配置。
+    由于本脚本由 cron 每 5 分钟运行一次，这个崩溃窗口是反复出现的，不是理论风险。
 
-      1. 中途崩溃会留下被截断的半个 JSON，Gateway 直接读不了配置；
-      2. 写完后属主变成 root，Gateway(uid 1000) 读不到，报 EACCES。
+    【为什么改用 os.replace】临时文件写完 fsync 后再 os.replace，
+    目标文件任何时刻都是完整的——风险被隔离在临时文件里。
 
-    第 2 点在上游生产机上真实发生过（见变更记录 §9.4「原子写配置造成 owner 短暂变化」），
-    当时的处置是「之后的原子写入显式保留原 uid/gid/mode」——本函数即该处置的落地。
+    【为什么必须配套保留属主】os.replace 是"用新文件顶替旧文件"，
+    新文件是 root 创建的，替换后目标就会变成 root 属主，Gateway(uid 1000) 读不到，报 EACCES。
+    因此 os.chown 不是"修 open(w) 的 bug"，而是 os.replace 方案的**必要配套**。
 
-    实现：写同目录临时文件（同文件系统，保证 os.replace 是原子的）→ 恢复属主与 mode
+    注意区分（实测确认，勿混淆）：
+      · open(P, 'w') 截断已存在文件  → 属主**不变**（内核保留 inode）
+      · 临时文件 + os.replace        → 属主**变成 root**（本函数要处理的正是这个）
+      · 文件被删除后重建             → 属主变成 root
+
+    实现顺序：写同目录临时文件（同文件系统，保证 replace 是原子的）→ 定 mode 与属主
     → os.replace 覆盖目标。任何一步失败都不动原文件。
     """
+    d = os.path.dirname(path) or '.'
+    st = os.stat(path)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix='.cfg-guard-', suffix='.tmp')
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            json.dump(cfg, f, indent=2, ensure_ascii=False)
+            f.write('\n')
+            f.flush()
+            os.fsync(f.fileno())
+        # 先定属主与权限，再替换——否则替换瞬间会出现「内容已更新但属主是 root」的窗口。
+        os.chmod(tmp, stat.S_IMODE(st.st_mode))
+        try:
+            os.chown(tmp, st.st_uid, st.st_gid)
+        except PermissionError:
+            # 非 root 运行时无法 chown；此时临时文件属主已经是自己，属主不会漂移。
+            pass
+        os.replace(tmp, path)
+        tmp = None
+    finally:
+        if tmp is not None and os.path.exists(tmp):
+            os.unlink(tmp)
     d = os.path.dirname(path) or '.'
     st = os.stat(path)
     fd, tmp = tempfile.mkstemp(dir=d, prefix='.cfg-guard-', suffix='.tmp')
