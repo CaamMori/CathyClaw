@@ -43,6 +43,25 @@ sudo ./scripts/install.sh --with-task-engine
 sudo ./scripts/install.sh --help
 ```
 
+## 备份与还原
+
+安装后自动排期，无需手工配置：
+
+| 组件 | 排期 | 作用 |
+|---|---|---|
+| `nightly-backup.sh` | 每日 04:17 | 打包 `/data/state`、`/data/etc/openclaw` 等关键状态，生成 `.sha256`，保留 7 份 |
+| `backup-verify.sh` | 每周日 05:30 | **只读校验**最新备份：可解压、校验和匹配、含核心配置、未过期；异常推 Telegram |
+| `openclaw-restore.sh` | 手动执行 | 从归档还原，含校验、还原前快照、权限修复、服务重启与健康确认 |
+
+```bash
+sudo openclaw-restore.sh --list              # 列出可用备份（含大小/时间/校验状态）
+sudo openclaw-restore.sh --dry-run <备份>    # 只校验与预演，不落盘
+sudo openclaw-restore.sh                     # 交互式选择并还原
+```
+
+设计要点：**备份存在 ≠ 备份可用**。所以除了日备，还有每周的可用性校验；还原前会先存一份
+当前状态快照，校验和不过直接拒绝还原——宁可不动，也不要把系统解包成半毁状态。
+
 ## 目录说明
 
 ```

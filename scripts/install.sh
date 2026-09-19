@@ -926,8 +926,10 @@ ok "策略文件已写入"
 # ── 9. 备份 ──
 step "9. 备份"
 # 备份统一由运维矩阵的 nightly-backup.sh 承担（见 10.7 安装 + /etc/cron.d/openclaw-ops 排期），
-# 保留 7 天，落盘 /data/backups/nightly/。
-ok "备份策略：nightly-backup.sh（由运维矩阵排期）"
+# 还原由手动执行的 openclaw-restore.sh 承担（还原是有状态破坏性的操作，不排 cron），
+# 备份可用性由 backup-verify.sh 每周日校验（只校验不落地）。
+# 归档落盘 /data/state/backups/config/，默认保留 7 份（BACKUP_KEEP 可覆盖）。
+ok "备份策略：nightly-backup.sh 每日 + backup-verify.sh 每周校验（由运维矩阵排期）"
 
 # ── 10. 巡检与日志轮转 ──
 step "10. 巡检与日志轮转"
@@ -1088,8 +1090,12 @@ cat > /etc/cron.d/openclaw-ops << 'CRONEOF'
 */5 * * * * root /usr/local/bin/fix-gateway-dns.sh
 # skills CLI 自愈
 */30 * * * * root /usr/local/bin/ensure-skill-bins.sh
-# 全量备份，保留 7 天
+# 全量备份，保留 7 天（BACKUP_KEEP 可覆盖）
 17 4 * * * root /usr/local/bin/nightly-backup.sh
+# 还原演练：每周日 05:30 校验最新备份的 sha256 与归档可读性，损坏则告警。
+# 刻意【不】真还原——自动还原会在无人值守时把线上状态覆盖掉，风险远大于收益。
+# 这条 cron 的意义是：把"备份到底能不能用"从"出事当天才知道"提前到"每周日就知道"。
+30 5 * * 0 root /usr/local/bin/backup-verify.sh
 # 环境快照
 30 4 * * * root /usr/local/bin/gen-env-snapshot.sh
 CRONEOF
