@@ -179,3 +179,61 @@ openclaw.json 引用了 5 个环境变量，其中 1 个已就绪。
 
 这是该仓库首次 CI 全绿。Gitleaks 使用仓库内自定义规则在真实 runner 上
 报 0 误报——与本地实测一致。
+
+## 十、附带的第二个真实缺陷：verify 偶发 task busy
+
+推完文档后，**一个只改 markdown 的提交让 CI 变红**，而上一提交同一 job 是绿的。
+这正是 flaky 的典型症状，值得追到底——它暴露的不是测试问题，是产品问题。
+
+- 失败用例：`test_private_directory_and_log_permissions`，失败在 `verify` 返回 1
+- 本地复现：单跑 5 次全过、全套 3 次全过（74 passed）——**本地不复现**
+
+### 根因
+
+`worker()` 原本在**持有 `run.lock` 期间**写入 `awaiting_verification`：
+
+```python
+with open_lock(lock_path) as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    ...
+    data.update(status="awaiting_verification", ...)   # 状态已对外可见
+    save(path, data)
+    heartbeat(hb_path, data["status"])                 # 但锁还没释放
+# ← 到这里才释放
+```
+
+于是存在一个窗口：**状态可读，锁未释放**。此时 `verify` 的
+`flock(LOCK_EX|LOCK_NB)` 失败 → `error: task busy` → 返回 1。
+
+而"看到 `awaiting_verification` 就立刻 verify"是**完全正常的操作**，
+所以这是真实运维同样会踩到的缺陷。高负载的 CI runner 把这个窗口撑开了。
+
+### 修法
+
+把终态写入与心跳移到 `with` 之外。依据：锁的语义是"独占执行权"，
+不是"保护 task.json"（`save` 走 `atomic_write`，本身原子，无需持锁）。
+执行期间仍持锁，执行结束即释放，之后才公布终态——
+**对外可见的状态与可操作状态保持一致**。
+
+### 证据：用人为延迟验证因果，而非碰运气复现
+
+本机负载撑不开窗口，所以"跑一遍看是否 busy"没有辨别力（实测修复前后都 30/30 通过）。
+改为在旧代码的"写终态→释放锁"之间插入 0.5s 延迟：
+
+| 版本 | 加 0.5s 延迟 | 结果 |
+|---|---|---|
+| 修复前 | 是 | **0 通过 / 5 失败**，全部 `error: task busy` |
+| 修复后 | 是 | **5 通过 / 0 失败** |
+
+报错与 CI 上那次完全一致，因果链闭合。
+
+### 回归测试的选择
+
+断言的是**结构性不变量**——`awaiting_verification` 必须写在 `with` 块之外——
+而不是"跑一遍看会不会 busy"。理由同上：后者在修复前后都会通过，
+是个没有辨别力的假防线，留着只提供虚假的安全感。
+
+新测试已验证双向有效：修复版通过；修复前失败，且失败信息直指根因
+（`awaiting_verification 在 with 块内写入——锁未释放时状态就已可见，verify 会偶发 'task busy'`）。
+
+CI 确认：`75 passed in 27.52s`（含新增用例），CI 与 Security 双绿。
