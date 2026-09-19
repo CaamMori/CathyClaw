@@ -191,11 +191,30 @@ compose group_add  : "999"      ← 不一致
 
 修复：把 task-engine 落盘提前到 §10.7a（早于 systemd 块）。
 
+### 12. 测试套件在负载环境下偶发超时（非功能缺陷）
+
+在已部署机器上跑 task-engine 回归时，偶发 1～2 个用例 `TimeoutExpired`。
+
+排查结论：**环境抖动，不是功能缺陷**。每次 CLI 调用都会新起一个 python
+进程且硬超时 5s，而该机器同时跑着 `te-daemon`（30s 一轮 reconcile）、
+`ocwatch`、`cdp-relay`，进程启动可能被挤慢。
+
+证据：同一台机器上先出现 2 个失败，紧接着连续 3 次全绿；本地亦 32/32。
+
+修复：超时改为可配置，默认 15s（`TE_TEST_TIMEOUT` 可覆盖）。
+**未削弱任何断言** —— 用例自身的行为时限是独立的，不受此影响。
+改后容器内连续 5 次运行全部通过（5/5）。
+
+> 顺带澄清一个易误判点：`te-daemon` 读的是自己的 `TE_DIR`（默认生产路径），
+> 而测试用 `TASK_ENGINE_HOME` 指向临时目录，两者本就隔离；
+> 且 daemon 只做观察与告警、**从不写任务状态**，不可能污染测试数据。
+
 ---
 
 ## 四、修复清单
 
 ```
+559c8ea  test: 子进程超时可配置，消除负载环境下的偶发超时
 8508ce5  fix: DOCKER_GROUP_ID 数字兜底架空了 socket 属组探测
 4e0b652  fix: warn() 被调用 16 次却从未定义
 0ed8bb1  fix: docker-cli 包装硬编码宿主路径，沙箱内 docker 不可用
@@ -224,10 +243,11 @@ a442dc3  fix: openclaw.json schema 嵌套错误 + fallback/telegram 兜底
 | 容器进程属组 | `1000(node),988` |
 | 常驻服务 | `te-daemon` / `ocwatch` / `openclaw-cdp-relay` 全部 active + enabled |
 | task-engine | 8 个组件 + 4 个测试文件；属主 `1000:1000` |
-| task-engine 回归 | **32/32 通过**（容器内 `unittest discover`） |
+| task-engine 回归 | **32/32 通过**（容器内 `unittest discover`，连续 5 次全绿） |
 | 泄漏检查 | 0（TG ID / 密码 / 生产机 IP 均无残留） |
 | 运维 cron | 13 条 |
 | 出口判定 | 正确识别为海外机 → 跳过 mihomo，直连出海 |
+| 幂等性 | 在已部署机器上重跑 install.sh：无 FAIL、无 `command not found`、无 `not a directory`，Gateway `healthy`，te-daemon 正常启动 |
 
 ### 验证路径（同一台机器，全部重跑过）
 
