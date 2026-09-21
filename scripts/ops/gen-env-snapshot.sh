@@ -16,7 +16,7 @@ memline=$(free -h | awk '/^Mem:/{printf "%s 总量 / %s 已用 / %s 可用", $2,
 swapline=$(free -h | awk '/^Swap:/{if ($2=="0" || $2=="0B") print "无"; else printf "%s 总量 / %s 已用", $2, $3}')
 diskline=$(df -h / | awk 'NR==2{printf "%s 总量 / %s 已用 (%s) / %s 剩余", $2, $3, $5, $4}')
 # 公网 IP 是云平台 DNAT 映射，网卡上不存在（换机/换云时人工更新此值）
-PUB_IP="${PUB_IP:-YOUR_SERVER_PUBLIC_IP}"
+PUB_IP="160.202.238.171"
 nicip=$(ip -4 addr show scope global 2>/dev/null | awk '/inet/{print $2}' | cut -d/ -f1 | tr '\n' ' ' | sed 's/ $//')
 
 ver=$(docker exec openclaw-gateway openclaw --version 2>/dev/null | head -1)

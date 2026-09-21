@@ -1,6 +1,7 @@
 ---
 name: host-operations
 description: Use before host, Docker, Gateway, Mihomo, Telegram networking, systemd, Nginx, restart, recovery, health-check, or infrastructure troubleshooting tasks. Requires reading current state and preserving rollback.
+user-invocable: false
 ---
 
 # Host Operations

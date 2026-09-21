@@ -1,0 +1,38 @@
+# OpenClaw 运维 cron 矩阵 — 由 install.sh 渲染到 /etc/cron.d/openclaw-ops
+# 每个变量在安装时替换为实际值
+
+# 每 2 分钟确保沙箱容器重启策略为 unless-stopped
+*/2 * * * * root __PREFIX__/pin-sbx-restart.sh
+
+# 每 2 分钟守护模型 API 出口
+*/2 * * * * root __PREFIX__/mihomo-guard.sh
+
+# 每 3 分钟检查 Telegram 入站轮询是否僵死
+*/3 * * * * root /data/scripts/ensure-telegram-alive.sh >/dev/null 2>&1
+
+# 每 5 分钟守护沙箱全功能配置(binds + browser),防漂移/重建丢失
+*/5 * * * * root __PREFIX__/openclaw-cfg-guard.py
+
+# 每 5 分钟检查 gateway DNS 是否被回滚为 127.0.0.11
+*/5 * * * * root __PREFIX__/fix-gateway-dns.sh
+
+# 每 10 分钟关键项快检(全绿静默,异常推 Telegram)
+*/10 * * * * root __PREFIX__/selfcheck-quick-cron.sh
+
+# 每 10 分钟检查已登记能力;正常静默,缺失则确定性恢复
+*/10 * * * * root __PREFIX__/capability-watch.py
+
+# 每 30 分钟检查 Chromium 二进制/依赖
+*/30 * * * * root __PREFIX__/ensure-browser-alive.sh
+
+# 每 30 分钟检查 skill 工具链
+*/30 * * * * root __PREFIX__/ensure-skill-bins.sh >/dev/null 2>&1
+
+# 每天 04:17 夜间备份
+17 4 * * * root __PREFIX__/nightly-backup.sh >/dev/null 2>&1
+
+# 每天 04:30 生成环境快照
+30 4 * * * root __PREFIX__/gen-env-snapshot.sh >/dev/null 2>&1
+
+# 每天 08:00 发送一次确定性健康摘要(不调用 Agent/模型)
+0 8 * * * root __PREFIX__/daily-health-summary.sh --send >/dev/null 2>&1

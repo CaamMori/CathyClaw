@@ -1,6 +1,7 @@
 ---
 name: data-integrity-delivery
 description: Use for Excel, CSV, PDF, HTML, charts, reports, calculations, scraped data, batch processing, or any deliverable containing derived numbers. Requires independent read-back and reconciliation.
+user-invocable: false
 ---
 
 # Data Integrity Delivery

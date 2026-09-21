@@ -2,10 +2,8 @@
 # mihomo-guard.sh v2 — 模型 API 出口连通守护
 # 每 2 分钟探测；连续 2 次失败自动切节点；自愈失败且全死持续 6 分钟 → 推一次 Telegram 告警（恢复后自动解除）。
 GW=openclaw-gateway
-# 模型 API 出口探测地址（改成你的模型网关 /health 或 /v1/models 端点）
-PROBE_URL="${MODEL_API_PROBE_URL:-https://your-model-gateway.example.com/v1/models}"
-# 告警推送目标：优先用环境变量 TE_ALERT_TARGET，缺省回退到占位符（请替换为你的 Telegram user ID）
-TARGET="${TE_ALERT_TARGET:-YOUR_TELEGRAM_USER_ID}"
+PROBE_URL="https://newapitest.caner.hk/v1/models"
+TARGET="${TARGET_CHAT_ID:-YOUR_TELEGRAM_CHAT_ID}"
 STATE=/var/run/mihomo-guard.fail
 DEAD=/var/run/mihomo-guard.alldead
 LOG=/var/log/mihomo-guard.log

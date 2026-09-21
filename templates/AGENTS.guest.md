@@ -55,6 +55,7 @@ Skill 的 description 负责路由；命中下列任务时，执行前读取对�
 - 超过 30 秒、后台任务、部署、上传、发送、跨机写入、任务板与验收：`durable-task-delivery`。
 - Excel/CSV/PDF/HTML、图表、报告、计算、抓取数据、批处理：`data-integrity-delivery`。
 - 搜索/下载/API 失败，403/429/503、TLS、超时、连接重置、多源研究：`research-recovery`。
+- 工具/命令/Skill/依赖缺失、环境异常或运行时报错:`capability-recovery`(已批准能力自动恢复,新能力生成提案;不得恢复宿主级能力)。
 
 路由规则必须常驻；具体步骤由 Skill 与其引用的 runbook 按需注入。
 

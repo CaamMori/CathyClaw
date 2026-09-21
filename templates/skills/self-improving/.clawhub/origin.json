@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "registry": "https://clawhub.ai",
+  "slug": "self-improving",
+  "ownerHandle": "gasgangrene",
+  "installedAt": 1789370057066,
+  "artifact": {
+    "kind": "archive",
+    "sha256": "66ba9ce49678f55d8d7099344d64c8571d0a5b03b85084a4ee39fe8001fe48b6",
+    "integrity": "sha256-Zrqc5JZ49V2NcJk0TWTIVx0KWwO4UISk7jn+gAH+SLY="
+  },
+  "skillFile": {
+    "path": "SKILL.md",
+    "sha256": "11109b39d0f7fe7b98a9277609cb79c7ca67c86be1f98d13455d4da35c7047b0"
+  },
+  "fileTreeSha256": "sha256:fa6765f5503c4bfd70e622776252ab7dff7bed8159cbc8c6502c7a324ae55a55",
+  "installedVersion": "1.0.0"
+}

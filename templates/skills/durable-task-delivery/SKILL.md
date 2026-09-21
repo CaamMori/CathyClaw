@@ -1,6 +1,7 @@
 ---
 name: durable-task-delivery
 description: Use for tasks over 30 seconds, background or unattended work, deployment, upload, external sending, Git push, cross-host writes, taskboard operations, or any task requiring durable progress and acceptance verification.
+user-invocable: false
 ---
 
 # Durable Task Delivery

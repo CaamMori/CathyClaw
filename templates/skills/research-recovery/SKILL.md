@@ -1,6 +1,7 @@
 ---
 name: research-recovery
 description: Use when web search, scraping, downloads, APIs, or research sources fail; for 403/429/503, TLS errors, timeouts, connection resets, missing data, or multi-source verification. Prevents premature 'cannot obtain' conclusions.
+user-invocable: false
 ---
 
 # Research Recovery

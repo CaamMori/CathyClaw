@@ -1,5 +1,5 @@
 #!/bin/bash
-# ensure-browser-alive.sh — 幂等自愈:chromium 二进制 + 浏览器进程
+# ensure-browser-alive.sh — 幂等自愈 Chromium 二进制/依赖;浏览器进程按需启动
 #
 # 历史缺陷(v1):
 #   - chromium 缺失时调用 ensure-browser.sh,后者会跑 `apt-get update`,
@@ -87,17 +87,10 @@ main() {
     fi
   fi
 
-  # 浏览器进程
-  if ! docker exec "$GW" openclaw browser status --json 2>/dev/null | grep -q '"running":[[:space:]]*true'; then
-    log "浏览器未运行 → start"
-    timeout 90 docker exec "$GW" openclaw browser start >>"$LOG" 2>&1
-    sleep 5
-    if docker exec "$GW" openclaw browser status --json 2>/dev/null | grep -q '"running":[[:space:]]*true'; then
-      log "已恢复"
-    else
-      log "启动失败,下轮重试"
-    fi
-  fi
+  # OpenClaw 2026.9.4 的浏览器为按需启动并在空闲后自动回收。
+  # 不在健康守护中强制 start,避免每 5 分钟制造 Chromium 冷启动和聊天延迟抖动。
+  # browser 能力及真实出口仍由按需调用和 selfcheck browser_egress 验证。
+  log "chromium 二进制可用;浏览器进程保持按需启动"
 
   tail -n 800 "$LOG" > "$LOG.tmp" 2>/dev/null && mv "$LOG.tmp" "$LOG"
   exit 0
